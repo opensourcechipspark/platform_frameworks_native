@@ -145,6 +145,8 @@ protected:
     virtual int setUsage(uint32_t reqUsage);
 
 public:
+    virtual int changehw(int rotation);
+    bool shouldchange;
     virtual int lock(ANativeWindow_Buffer* outBuffer, ARect* inOutDirtyBounds);
     virtual int unlockAndPost();
 

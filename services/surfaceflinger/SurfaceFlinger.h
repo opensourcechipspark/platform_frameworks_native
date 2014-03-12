@@ -78,6 +78,18 @@ enum {
     eTransactionMask          = 0x07
 };
 
+enum
+{
+    /* NOTE: These enums are unknown to Android.
+     * Android only checks against HWC_FRAMEBUFFER.
+     * This layer is to be drawn into the framebuffer by hwc blitter */
+    //HWC_TOWIN0 = 0x10,
+    //HWC_TOWIN1,
+    HWC_BLITTER = 100,
+    HWC_DIM,
+    HWC_CLEAR_HOLE
+};
+
 class SurfaceFlinger : public BnSurfaceComposer,
                        private IBinder::DeathRecipient,
                        private HWComposer::EventHandler
@@ -124,6 +136,7 @@ public:
     // is received
     // TODO: this should be made accessible only to MessageQueue
     void onMessageReceived(int32_t what);
+    void debugShowFPS() const;
 
     // for debugging only
     // TODO: this should be made accessible only to HWComposer
@@ -132,6 +145,15 @@ public:
     RenderEngine& getRenderEngine() const {
         return *mRenderEngine;
     }
+
+    // ro.sf.hwrotation
+    int mHardwareOrientation;
+    int mUseLcdcComposer;
+	Mutex  mCaptureScreenLock;
+    // Get hardware orientation
+    int getHardwareOrientation() const { return mHardwareOrientation; }
+    bool orientationSwap() const { return mHardwareOrientation % 2; }
+    bool ReleaseOldBuffer(void);    //rk : for lcdc composer
 
 private:
     friend class Client;
@@ -457,7 +479,7 @@ private:
     volatile nsecs_t mDebugInTransaction;
     nsecs_t mLastTransactionTime;
     bool mBootFinished;
-
+    int mWfdOptimize;
     // these are thread safe
     mutable MessageQueue mEventQueue;
     FrameTracker mAnimFrameTracker;
@@ -478,6 +500,9 @@ private:
 
     Daltonizer mDaltonizer;
     bool mDaltonize;
+    int     mDebugFPS;
+    int mcapFlag;
+
 };
 
 }; // namespace android

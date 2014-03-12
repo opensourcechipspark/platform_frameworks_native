@@ -40,6 +40,7 @@
 #include <utils/Log.h>
 #include <utils/String8.h>
 #include <utils/Trace.h>
+#include <cutils/properties.h>
 
 EGLAPI const char* eglQueryStringImplementationANDROID(EGLDisplay dpy, EGLint name);
 #define CROP_EXT_STR "EGL_ANDROID_image_crop"
@@ -116,6 +117,7 @@ static bool isEglImageCroppable(const Rect& crop) {
     return hasEglAndroidImageCrop() && (crop.left == 0 && crop.top == 0);
 }
 
+static int UseLcdcComposer = 0;
 GLConsumer::GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t tex,
         uint32_t texTarget, bool useFenceSync, bool isControlledByApp) :
     ConsumerBase(bq, isControlledByApp),
@@ -133,6 +135,7 @@ GLConsumer::GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t tex,
     mEglDisplay(EGL_NO_DISPLAY),
     mEglContext(EGL_NO_CONTEXT),
     mCurrentTexture(BufferQueue::INVALID_BUFFER_SLOT),
+    mCurrentTextureOld(BufferQueue::INVALID_BUFFER_SLOT),    
     mAttached(true)
 {
     ST_LOGV("GLConsumer");
@@ -141,6 +144,9 @@ GLConsumer::GLConsumer(const sp<IGraphicBufferConsumer>& bq, uint32_t tex,
             sizeof(mCurrentTransformMatrix));
 
     mConsumer->setConsumerUsageBits(DEFAULT_USAGE_FLAGS);
+    char value[PROPERTY_VALUE_MAX];
+    property_get("ro.sf.lcdc_composer", value, "0");
+    UseLcdcComposer = atoi(value);
 }
 
 status_t GLConsumer::setDefaultMaxBufferCount(int bufferCount) {
@@ -204,6 +210,23 @@ status_t GLConsumer::updateTexImage() {
     return bindTextureImageLocked();
 }
 
+status_t  GLConsumer::ReleaseOldBuffer()
+{
+    status_t err = NO_ERROR;
+    Mutex::Autolock lock(mMutex);
+    if (mCurrentTextureOld != BufferQueue::INVALID_BUFFER_SLOT) {
+        status_t status = releaseBufferLocked(
+                    mCurrentTextureOld, mCurrentTextureBufOld, mEglDisplay,
+                    mEglSlots[mCurrentTextureOld].mEglFence);                
+        if (status < NO_ERROR) {
+                ST_LOGE("updateAndRelease: failed to release buffer: %s (%d)",
+                       strerror(-status), status);
+                err = status;
+        }
+        mCurrentTextureOld = BufferQueue::INVALID_BUFFER_SLOT;
+    }
+    return err;
+}
 
 status_t GLConsumer::releaseTexImage() {
     ATRACE_CALL();
@@ -401,6 +424,13 @@ status_t GLConsumer::updateAndReleaseLocked(const BufferQueue::BufferItem& item)
             buf, mSlots[buf].mGraphicBuffer->handle);
 
     // release old buffer
+    if(UseLcdcComposer && !strstr(mName.string(), "unnamed"))
+    {
+        mCurrentTextureOld = mCurrentTexture;
+        mCurrentTextureBufOld = mCurrentTextureBuf;
+    }
+    else
+    {
     if (mCurrentTexture != BufferQueue::INVALID_BUFFER_SLOT) {
         status_t status = releaseBufferLocked(
                 mCurrentTexture, mCurrentTextureBuf, mEglDisplay,
@@ -412,7 +442,7 @@ status_t GLConsumer::updateAndReleaseLocked(const BufferQueue::BufferItem& item)
             // keep going, with error raised [?]
         }
     }
-
+    }
     // Update the GLConsumer state.
     mCurrentTexture = buf;
     mCurrentTextureBuf = mSlots[buf].mGraphicBuffer;

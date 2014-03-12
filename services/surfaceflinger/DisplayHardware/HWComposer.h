@@ -95,6 +95,8 @@ public:
 
     // commits the list
     status_t commit();
+    status_t layerRecover();
+    status_t setSkipFrame(  uint32_t skipflag ) ;
 
     // release hardware resources and blank screen
     status_t release(int disp);
@@ -116,6 +118,7 @@ public:
     // does this display have layers handled by GLES
     bool hasGlesComposition(int32_t id) const;
 
+    bool hasLcdComposition(int32_t id) const;
     // get the releaseFence file descriptor for a display's framebuffer layer.
     // the release fence is only valid after commit()
     sp<Fence> getAndResetReleaseFence(int32_t id);
@@ -162,12 +165,14 @@ public:
         virtual void setBlending(uint32_t blending) = 0;
         virtual void setTransform(uint32_t transform) = 0;
         virtual void setFrame(const Rect& frame) = 0;
+        virtual void setRealTransform(uint32_t realtransform) = 0;
         virtual void setCrop(const FloatRect& crop) = 0;
         virtual void setVisibleRegionScreen(const Region& reg) = 0;
         virtual void setBuffer(const sp<GraphicBuffer>& buffer) = 0;
         virtual void setAcquireFenceFd(int fenceFd) = 0;
         virtual void setPlaneAlpha(uint8_t alpha) = 0;
         virtual void onDisplayed() = 0;
+		virtual void setLayername( const char *layername) = 0;
     };
 
     /*
@@ -317,6 +322,7 @@ private:
         bool connected;
         bool hasFbComp;
         bool hasOvComp;
+        bool haslcdComp;
         size_t capacity;
         hwc_display_contents_1* list;
         hwc_layer_1* framebufferTarget;

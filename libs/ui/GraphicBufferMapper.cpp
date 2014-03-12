@@ -29,6 +29,13 @@
 
 #include <hardware/gralloc.h>
 
+#ifdef TARGET_BOARD_PLATFORM_RK30XXB
+#include <pthread.h>
+#include <hardware/hal_public.h>
+#define private_handle_t IMG_native_handle_t
+int gRsBufBase = 0;
+extern pthread_mutex_t s_gb_lock ;
+#endif
 
 namespace android {
 // ---------------------------------------------------------------------------
@@ -51,8 +58,21 @@ status_t GraphicBufferMapper::registerBuffer(buffer_handle_t handle)
     ATRACE_CALL();
     status_t err;
 
+#ifdef TARGET_BOARD_PLATFORM_RK30XXB
+    struct private_handle_t* srchnd =  (struct private_handle_t *)handle;
+   	pthread_mutex_lock(&s_gb_lock);
+#endif
     err = mAllocMod->registerBuffer(mAllocMod, handle);
 
+#ifdef TARGET_BOARD_PLATFORM_RK30XXB
+    if(err == 0xf3 )
+    {
+        ALOGD(" in registerBuffer 0xf3  srchnd->iBase=%p", srchnd->iBase);
+        gRsBufBase = srchnd->iBase;
+        err = 0;
+    }
+	pthread_mutex_unlock(&s_gb_lock);
+#endif
     ALOGW_IF(err, "registerBuffer(%p) failed %d (%s)",
             handle, err, strerror(-err));
     return err;

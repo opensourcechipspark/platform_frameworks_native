@@ -93,6 +93,7 @@ public:
     //
     // This calls doGLFenceWait to ensure proper synchronization.
     status_t updateTexImage();
+    status_t  ReleaseOldBuffer();
 
     // releaseTexImage releases the texture acquired in updateTexImage().
     // This is intended to be used in single buffer mode.
@@ -425,6 +426,8 @@ private:
     // that no buffer is bound to the texture. A call to setBufferCount will
     // reset mCurrentTexture to INVALID_BUFFER_SLOT.
     int mCurrentTexture;
+    int mCurrentTextureOld;     //rk : for lcdc composer
+    sp<GraphicBuffer> mCurrentTextureBufOld;
 
     // mAttached indicates whether the ConsumerBase is currently attached to
     // an OpenGL ES context.  For legacy reasons, this is initialized to true,

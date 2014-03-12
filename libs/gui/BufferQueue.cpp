@@ -32,6 +32,7 @@
 #include <utils/Log.h>
 #include <utils/Trace.h>
 #include <utils/CallStack.h>
+#include "../../../../hardware/rk29/libgralloc_ump/gralloc_priv.h"
 
 // Macros for including the BufferQueue name in log messages
 #define ST_LOGV(x, ...) ALOGV("[%s] "x, mConsumerName.string(), ##__VA_ARGS__)
@@ -65,6 +66,15 @@ static const char* scalingModeName(int scalingMode) {
     }
 }
 
+#include <cutils/properties.h>
+static int UseLcdcComposer = 0;
+typedef struct _cts_data {
+     int vir_cnt ;
+     int uname_cnt ;
+     int uname_read_cnt;
+} cts_data;
+
+cts_data gcts_bq = {0,};
 BufferQueue::BufferQueue(const sp<IGraphicBufferAlloc>& allocator) :
     mDefaultWidth(1),
     mDefaultHeight(1),
@@ -95,6 +105,22 @@ BufferQueue::BufferQueue(const sp<IGraphicBufferAlloc>& allocator) :
     } else {
         mGraphicBufferAlloc = allocator;
     }
+    char value[PROPERTY_VALUE_MAX];
+    property_get("ro.sf.lcdc_composer", value, "0");
+    UseLcdcComposer = atoi(value);    
+	property_set("sys.glibgui", "1.001");
+
+    property_get("sys.cts_gts.status", value, "0");
+
+    IsCTS =  !strcmp(value,"true");
+    if(IsCTS)
+    {
+        system("mkdir /data/virt_cts/");          
+        system("chmod 777 /data/virt_cts/");
+    }
+
+	
+    //UseLcdcComposer = 1;
 }
 
 BufferQueue::~BufferQueue() {
@@ -125,7 +151,8 @@ status_t BufferQueue::setDefaultBufferFormat(uint32_t defaultFormat) {
 
 status_t BufferQueue::setConsumerUsageBits(uint32_t usage) {
     Mutex::Autolock lock(mMutex);
-    mConsumerUsageBits = usage;
+   // mConsumerUsageBits |= usage;
+		mConsumerUsageBits = usage;
     return NO_ERROR;
 }
 
@@ -221,6 +248,9 @@ int BufferQueue::query(int what, int* outValue)
     case NATIVE_WINDOW_CONSUMER_USAGE_BITS:
         value = mConsumerUsageBits;
         break;
+    case 1000:  // rk : for lcdc composer, is BrowserActivity ?
+        value = strcmp(mConsumerName.string(), "com.android.browser/com.android.browser.BrowserActivity") ? 0 : 1;
+        break;
     default:
         return BAD_VALUE;
     }
@@ -250,16 +280,24 @@ status_t BufferQueue::requestBuffer(int slot, sp<GraphicBuffer>* buf) {
     return NO_ERROR;
 }
 
+static int fbFd = -1;
+#define RK_FBIOSET_CONFIG_DONE		0x4628
 status_t BufferQueue::dequeueBuffer(int *outBuf, sp<Fence>* outFence, bool async,
         uint32_t w, uint32_t h, uint32_t format, uint32_t usage) {
     ATRACE_CALL();
     ST_LOGV("dequeueBuffer: w=%d h=%d fmt=%#x usage=%#x", w, h, format, usage);
-
+   // struct timeval tpend1, tpend2;
+  //  long usec1 = 0;
+#ifdef USE_LCDC_COMPOSER
+    if(w == -1 && h == -2){
+        w = mDefaultHeight;
+        h = mDefaultWidth;
+    }
+#endif
     if ((w && !h) || (!w && h)) {
         ST_LOGE("dequeueBuffer: invalid size: w=%u, h=%u", w, h);
         return BAD_VALUE;
     }
-
     status_t returnFlags(OK);
     EGLDisplay dpy = EGL_NO_DISPLAY;
     EGLSyncKHR eglFence = EGL_NO_SYNC_KHR;
@@ -463,6 +501,19 @@ status_t BufferQueue::dequeueBuffer(int *outBuf, sp<Fence>* outFence, bool async
             mSlots[*outBuf].mFrameNumber,
             mSlots[*outBuf].mGraphicBuffer->handle, returnFlags);
 
+    #if 0
+    if(UseLcdcComposer)
+    {
+        if(fbFd < 0)
+            fbFd = open("/dev/graphics/fb0", O_RDWR, 0);
+        if(fbFd < 0) 
+            ALOGE("dev/graphics/fb0 open failed");
+        int sync = 3;
+        if(fbFd >= 0)
+        	ioctl(fbFd, RK_FBIOSET_CONFIG_DONE, &sync);
+
+    }
+    #endif
     return returnFlags;
 }
 
@@ -481,12 +532,10 @@ status_t BufferQueue::queueBuffer(int buf,
 
     input.deflate(&timestamp, &isAutoTimestamp, &crop, &scalingMode, &transform,
             &async, &fence);
-
     if (fence == NULL) {
         ST_LOGE("queueBuffer: fence is NULL");
         return BAD_VALUE;
     }
-
     switch (scalingMode) {
         case NATIVE_WINDOW_SCALING_MODE_FREEZE:
         case NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW:
@@ -498,6 +547,37 @@ status_t BufferQueue::queueBuffer(int buf,
             return -EINVAL;
     }
 
+    if(IsCTS)
+    {
+        if(!strcmp(mConsumerName.string(),"Encode Virtual Test"))
+        {
+
+            FILE * pfile = NULL;
+            char layername[64] ; 
+            char cmd[64];
+            int bpp = 4;
+            struct private_handle_t* buffhnd = (struct private_handle_t*)mSlots[buf].mGraphicBuffer->handle;
+            if(HAL_PIXEL_FORMAT_RGB_565 == buffhnd->format)
+                bpp = 2;
+            else if(HAL_PIXEL_FORMAT_RGB_888 == buffhnd->format)
+                bpp = 3;
+
+           // ALOGD("dumpVirtual  write addr=%x,[%dx%d],fomt=%d,gvir_cnt=%d",buffhnd->base,buffhnd->width,buffhnd->height,buffhnd->format,gcts_bq.vir_cnt);
+
+            sprintf(layername,"/data/virt_cts/vir%d.bin",gcts_bq.vir_cnt);				
+            pfile = fopen(layername,"wb");
+            if(pfile)
+            { 
+                fwrite(( void *)buffhnd->base,(size_t)(buffhnd->width * buffhnd->height *bpp ),1,pfile);
+                fclose(pfile);
+                sprintf(cmd,"chmod 777 %s",layername);
+                system(cmd);    
+            }
+            gcts_bq.vir_cnt++; 
+            if(gcts_bq.vir_cnt >=6)
+                gcts_bq.vir_cnt =0;
+        }
+    }    
     sp<IConsumerListener> listener;
 
     { // scope for the lock
@@ -576,7 +656,8 @@ status_t BufferQueue::queueBuffer(int buf,
             // when the queue is not empty, we need to look at the front buffer
             // state and see if we need to replace it.
             Fifo::iterator front(mQueue.begin());
-            if (front->mIsDroppable) {
+            if (front->mIsDroppable) 
+            {
                 // buffer slot currently queued is marked free if still tracked
                 if (stillTracking(front)) {
                     mSlots[front->mBuf].mBufferState = BufferSlot::FREE;
@@ -860,6 +941,7 @@ void BufferQueue::freeAllBuffersLocked() {
     }
 }
 
+
 status_t BufferQueue::acquireBuffer(BufferItem *buffer, nsecs_t expectedPresent) {
     ATRACE_CALL();
     Mutex::Autolock _l(mMutex);
@@ -888,6 +970,8 @@ status_t BufferQueue::acquireBuffer(BufferItem *buffer, nsecs_t expectedPresent)
     }
 
     Fifo::iterator front(mQueue.begin());
+
+            
 
     // If expectedPresent is specified, we may not want to return a buffer yet.
     // If it's specified and there's more than one buffer queued, we may
@@ -967,9 +1051,50 @@ status_t BufferQueue::acquireBuffer(BufferItem *buffer, nsecs_t expectedPresent)
     *buffer = *front;
     ATRACE_BUFFER_INDEX(buf);
 
-    ST_LOGV("acquireBuffer: acquiring { slot=%d/%llu, buffer=%p }",
+    struct private_handle_t* buffhnd = (struct private_handle_t*)front->mGraphicBuffer->handle;
+    ST_LOGV("acquireBuffer: acquiring { slot=%d/%llu, buffer=%p,addr=%x }",
             front->mBuf, front->mFrameNumber,
-            front->mGraphicBuffer->handle);
+            front->mGraphicBuffer->handle,buffhnd->base);
+
+    if(IsCTS)
+    {
+        
+        if(strstr(mConsumerName.string(),"unnamed")) 
+        {
+             
+            FILE * pfile = NULL;
+            char layername[64] ;
+            char cmd[64]; 
+            int bpp = 4; 
+            
+            if(HAL_PIXEL_FORMAT_RGB_565 == buffhnd->format)
+                bpp = 2;
+            else if(HAL_PIXEL_FORMAT_RGB_888 == buffhnd->format)
+                bpp = 3;
+            sprintf(layername,"/data/virt_cts/vir%d.bin",gcts_bq.uname_cnt);				
+            pfile = fopen(layername,"rb"); 
+            //ALOGD("dumpVirtual pfile=%p,name=%s",pfile,layername);
+            if(pfile)
+            {
+                //ALOGD("dumpVirtual  read addr=%x,[%dx%d],filename=%s,bpp=%d",buffhnd->base,buffhnd->width,buffhnd->height,layername,bpp);
+
+                fread(( void *)buffhnd->base,(size_t)( buffhnd->width * buffhnd->height *bpp ),1,pfile);
+                fclose(pfile);
+                
+                //memcpy(( void *)((int)(buffhnd->base) + buffhnd->width * buffhnd->height / 2 ),( void *)buffhnd->base,(size_t)( buffhnd->width * buffhnd->height /2));
+                //memcpy(( void *)((int)(buffhnd->base) + buffhnd->width * buffhnd->height  ),( void *)buffhnd->base,(size_t)( buffhnd->width * buffhnd->height ));                
+                //memcpy(( void *)((int)(buffhnd->base) + buffhnd->width * buffhnd->height *2 ),( void *)buffhnd->base,(size_t)( buffhnd->width * buffhnd->height*2));
+                gcts_bq.uname_cnt++;
+                if(gcts_bq.uname_cnt >=6 )
+                {
+                    sprintf(cmd,"rm /data/virt_cts/*");
+                    system(cmd);    
+                } 
+            }
+
+        }    
+    }
+
     // if front buffer still being tracked update slot state
     if (stillTracking(front)) {
         mSlots[buf].mAcquireCalled = true;

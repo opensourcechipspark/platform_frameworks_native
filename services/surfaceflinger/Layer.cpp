@@ -78,7 +78,8 @@ Layer::Layer(SurfaceFlinger* flinger, const sp<Client>& client,
         mSecure(false),
         mProtectedByApp(false),
         mHasSurface(false),
-        mClientRef(client)
+        mClientRef(client),
+        mDrawingScreenshot(false)
 {
     mCurrentCrop.makeInvalid();
     mFlinger->getRenderEngine().genTextures(1, &mTextureName);
@@ -110,6 +111,7 @@ Layer::Layer(SurfaceFlinger* flinger, const sp<Client>& client,
     nsecs_t displayPeriod =
             flinger->getHwComposer().getRefreshPeriod(HWC_DISPLAY_PRIMARY);
     mFrameTracker.setDisplayRefreshPeriod(displayPeriod);
+	mLastRealtransform = 0;
 }
 
 void Layer::onFirstRef() {
@@ -129,6 +131,17 @@ void Layer::onFirstRef() {
 
     const sp<const DisplayDevice> hw(mFlinger->getDefaultDisplayDevice());
     updateTransformHint(hw);
+    const State& s(getDrawingState());
+    const Transform bufferOrientation(mCurrentTransform);
+    uint32_t realtransform = (hw->getTransform(false) * s.transform * bufferOrientation).getOrientation();
+    if(mFlinger->mUseLcdcComposer )
+    {
+        if (mFlinger->mUseLcdcComposer && strcmp("com.android.systemui.ImageWallpaper", mName.string())) {
+            realtransform = (hw->getTransform(false)).getOrientation() | 0x08;
+            realtransform = (realtransform << 24) & GRALLOC_USAGE_ROT_MASK;
+            mSurfaceFlingerConsumer->setConsumerUsageBits(getEffectiveUsage(realtransform));
+        }
+    }    
 }
 
 Layer::~Layer() {
@@ -155,6 +168,16 @@ void Layer::onLayerDisplayed(const sp<const DisplayDevice>& hw,
 void Layer::onFrameAvailable() {
     android_atomic_inc(&mQueuedFrames);
     mFlinger->signalLayerUpdate();
+	if (mFlinger->mUseLcdcComposer && strcmp("com.android.systemui.ImageWallpaper", getName().string()))
+	{
+		const sp<const DisplayDevice> hw(mFlinger->getDefaultDisplayDevice());
+		uint32_t realtransform = (hw->getTransform(false)).getOrientation() | 0x08;
+	    if (mLastRealtransform!=realtransform) {
+	        mLastRealtransform = realtransform;
+	        realtransform = (realtransform << 24) & GRALLOC_USAGE_ROT_MASK;
+	        mSurfaceFlingerConsumer->setConsumerUsageBits(getEffectiveUsage(realtransform));
+		  } 
+	}
 }
 
 // called with SurfaceFlinger::mStateLock from the drawing thread after
@@ -353,9 +376,9 @@ void Layer::setGeometry(
     // this gives us only the "orientation" component of the transform
     const State& s(getDrawingState());
     if (!isOpaque() || s.alpha != 0xFF) {
-        layer.setBlending(mPremultipliedAlpha ?
+        layer.setBlending( (mPremultipliedAlpha ?
                 HWC_BLENDING_PREMULT :
-                HWC_BLENDING_COVERAGE);
+                HWC_BLENDING_COVERAGE) |s.alpha<<16);
     }
 
     // apply the layer's transform, followed by the display's global transform
@@ -398,7 +421,22 @@ void Layer::setGeometry(
         // we can only handle simple transformation
         layer.setSkip(true);
     } else {
+        uint32_t realtransform = (hw->getTransform(false) * s.transform * bufferOrientation).getOrientation();
         layer.setTransform(orientation);
+        if(mFlinger->mUseLcdcComposer )
+        {
+            layer.setRealTransform(tr.getOrientation());
+            if (mFlinger->mUseLcdcComposer && strcmp("com.android.systemui.ImageWallpaper", mName.string())) {
+                realtransform = (hw->getTransform(false)).getOrientation() | 0x08;
+                realtransform = (realtransform << 24) & GRALLOC_USAGE_ROT_MASK;
+                mSurfaceFlingerConsumer->setConsumerUsageBits(getEffectiveUsage(realtransform));
+            }
+            else
+            {
+                layer.setTransform(orientation); // Wallpaper force 0
+
+            }
+        }    
     }
 }
 
@@ -412,10 +450,12 @@ void Layer::setPerFrameData(const sp<const DisplayDevice>& hw,
     const Transform& tr = hw->getTransform();
     Region visible = tr.transform(visibleRegion.intersect(hw->getViewport()));
     layer.setVisibleRegionScreen(visible);
-
+    
     // NOTE: buffer can be NULL if the client never drew into this
     // layer yet, or if we ran out of memory
     layer.setBuffer(mActiveBuffer);
+
+    layer.setLayername(getName().string());
 }
 
 void Layer::setAcquireFence(const sp<const DisplayDevice>& hw,
@@ -425,7 +465,8 @@ void Layer::setAcquireFence(const sp<const DisplayDevice>& hw,
     // TODO: there is a possible optimization here: we only need to set the
     // acquire fence the first time a new buffer is acquired on EACH display.
 
-    if (layer.getCompositionType() == HWC_OVERLAY) {
+   // if (layer.getCompositionType() == HWC_OVERLAY || layer.getCompositionType()==100) {
+        if (layer.getCompositionType() != HWC_FRAMEBUFFER) {   
         sp<Fence> fence = mSurfaceFlingerConsumer->getCurrentFence();
         if (fence->isValid()) {
             fenceFd = fence->dup();
@@ -637,9 +678,14 @@ bool Layer::getOpacityForFormat(uint32_t format) {
 void Layer::computeGeometry(const sp<const DisplayDevice>& hw, Mesh& mesh) const
 {
     const Layer::State& s(getDrawingState());
-    const Transform tr(hw->getTransform() * s.transform);
+    Transform tr(hw->getTransform() * s.transform);
+
     const uint32_t hw_h = hw->getHeight();
     Rect win(s.active.w, s.active.h);
+    if (mDrawingScreenshot) {
+        computeHWGeometry(tr, s.transform, hw);
+    }
+
     if (!s.active.crop.isEmpty()) {
         win.intersect(s.active.crop, &win);
     }
@@ -651,8 +697,55 @@ void Layer::computeGeometry(const sp<const DisplayDevice>& hw, Mesh& mesh) const
     position[1] = tr.transform(win.left,  win.bottom);
     position[2] = tr.transform(win.right, win.bottom);
     position[3] = tr.transform(win.right, win.top);
+
     for (size_t i=0 ; i<4 ; i++) {
         position[i].y = hw_h - position[i].y;
+    }
+}
+
+void Layer::computeHWGeometry(Transform& tr, const Transform& layerTransform, const sp<const DisplayDevice>& hw) const
+{
+    int hwrotation = mFlinger->getHardwareOrientation();
+    int hw_offset = hw->getWidth() - hw->getHeight();
+
+    if (hwrotation == DisplayState::eOrientation90) {
+        // 90 degree
+        tr = hw->getTransform(false) * layerTransform;
+        switch (hw->getHardwareRotation()){
+        case 0:
+            tr.set(tr.tx(), tr.ty());
+            break;
+        case 1:
+            tr.set(tr.tx(), tr.ty()-hw_offset);
+            break;
+        case 2:
+            tr.set(tr.tx()-hw_offset, tr.ty()-hw_offset);
+            break;
+        case 3:
+            tr.set(tr.tx()-hw_offset, tr.ty());
+            break;
+        }
+    } else if (hwrotation == DisplayState::eOrientation180) {
+        // 180 degree
+        tr = hw->getTransform(false) * layerTransform;
+        tr.set(tr.tx(), tr.ty());
+    } else if (hwrotation == DisplayState::eOrientation270) {
+        // 270 degree
+        tr = hw->getTransform(false) * layerTransform;
+        switch (hw->getHardwareRotation()){
+        case 0:
+            tr.set(tr.tx()-hw_offset, tr.ty()-hw_offset);
+            break;
+        case 1:
+            tr.set(tr.tx()-hw_offset, tr.ty());
+            break;
+        case 2:
+            tr.set(tr.tx(), tr.ty());
+            break;
+        case 3:
+            tr.set(tr.tx(), tr.ty()-hw_offset);
+            break;
+        }
     }
 }
 
@@ -1166,6 +1259,12 @@ void Layer::updateTransformHint(const sp<const DisplayDevice>& hw) const {
 // debugging
 // ----------------------------------------------------------------------------
 
+void Layer::ReleaseOldBuffer()
+{
+    if (mFlinger->mUseLcdcComposer) {
+        mSurfaceFlingerConsumer->ReleaseOldBuffer();
+    }
+}
 void Layer::dump(String8& result, Colorizer& colorizer) const
 {
     const Layer::State& s(getDrawingState());

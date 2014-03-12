@@ -60,7 +60,7 @@ extern char const * const gl_names[];
 extern char const * const egl_names[];
 
 extern egl_connection_t gEGLImpl;
-
+extern EGLBoolean gEGLImplSWOnly;
 // ----------------------------------------------------------------------------
 }; // namespace android
 // ----------------------------------------------------------------------------

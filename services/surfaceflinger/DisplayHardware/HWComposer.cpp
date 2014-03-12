@@ -42,7 +42,7 @@
 #include <cutils/properties.h>
 
 #include "HWComposer.h"
-
+#include <GLES/gl.h>
 #include "../Layer.h"           // needed only for debugging
 #include "../SurfaceFlinger.h"
 
@@ -112,8 +112,8 @@ HWComposer::HWComposer(
         // close FB HAL if we don't needed it.
         // FIXME: this is temporary until we're not forced to open FB HAL
         // before HWC.
-        framebuffer_close(mFbDev);
-        mFbDev = NULL;
+       // framebuffer_close(mFbDev);
+      //  mFbDev = NULL;
     }
 
     // If we have no HWC, or a pre-1.1 HWC, an FB dev is mandatory.
@@ -526,6 +526,7 @@ status_t HWComposer::createWorkList(int32_t id, size_t numLayers) {
                     + numLayers * sizeof(hwc_layer_1_t);
             free(disp.list);
             disp.list = (hwc_display_contents_1_t*)malloc(size);
+            memset(disp.list, 0, size);
             disp.capacity = numLayers;
         }
         if (hwcHasApiVersion(mHwc, HWC_DEVICE_API_VERSION_1_1)) {
@@ -537,6 +538,7 @@ status_t HWComposer::createWorkList(int32_t id, size_t numLayers) {
             disp.framebufferTarget->flags = 0;
             disp.framebufferTarget->handle = disp.fbTargetHandle;
             disp.framebufferTarget->transform = 0;
+            disp.framebufferTarget->realtransform = mFlinger->getDefaultDisplayDevice()->getOrientationTransform();
             disp.framebufferTarget->blending = HWC_BLENDING_PREMULT;
             if (hwcHasApiVersion(mHwc, HWC_DEVICE_API_VERSION_1_3)) {
                 disp.framebufferTarget->sourceCropf.left = 0;
@@ -633,6 +635,7 @@ status_t HWComposer::prepare() {
             DisplayData& disp(mDisplayData[i]);
             disp.hasFbComp = false;
             disp.hasOvComp = false;
+            disp.haslcdComp = false;
             if (disp.list) {
                 for (size_t i=0 ; i<disp.list->numHwLayers ; i++) {
                     hwc_layer_1_t& l = disp.list->hwLayers[i];
@@ -648,6 +651,12 @@ status_t HWComposer::prepare() {
                     }
                     if (l.compositionType == HWC_OVERLAY) {
                         disp.hasOvComp = true;
+                    }
+                    if ( (l.compositionType == HWC_TOWIN0 || l.compositionType == HWC_TOWIN1) )
+                    {
+                        if( mFlinger->mUseLcdcComposer)
+                            disp.hasOvComp = true;                       
+                        disp.haslcdComp = true;
                     }
                 }
                 if (disp.list->numHwLayers == (disp.framebufferTarget ? 1 : 0)) {
@@ -673,6 +682,11 @@ bool HWComposer::hasGlesComposition(int32_t id) const {
     return mDisplayData[id].hasFbComp;
 }
 
+bool HWComposer::hasLcdComposition(int32_t id) const {
+    if (uint32_t(id)>31 || !mAllocatedDisplayIDs.hasBit(id))
+        return false;
+    return mDisplayData[id].haslcdComp;
+}
 sp<Fence> HWComposer::getAndResetReleaseFence(int32_t id) {
     if (uint32_t(id)>31 || !mAllocatedDisplayIDs.hasBit(id))
         return Fence::NO_FENCE;
@@ -687,6 +701,28 @@ sp<Fence> HWComposer::getAndResetReleaseFence(int32_t id) {
         }
     }
     return fd >= 0 ? new Fence(fd) : Fence::NO_FENCE;
+}
+
+status_t HWComposer::setSkipFrame(  uint32_t skipflag ) {
+    int err = NO_ERROR;
+    if (mHwc) {             
+        for (size_t i=0 ; i<mNumDisplays ; i++) {
+            DisplayData& disp(mDisplayData[i]);         
+            if (disp.list) {      
+                disp.list->skipflag = skipflag;                   
+            }
+        }
+    }
+    return (status_t)err;
+}
+
+status_t HWComposer::layerRecover( ) 
+{
+    int err = NO_ERROR;
+    if (mHwc &&  mHwc->layer_recover ) {             
+        mHwc->layer_recover(mHwc, mNumDisplays, mLists);
+    }
+    return (status_t)err;
 }
 
 status_t HWComposer::commit() {
@@ -773,20 +809,40 @@ bool HWComposer::supportsFramebufferTarget() const {
     return (mHwc && hwcHasApiVersion(mHwc, HWC_DEVICE_API_VERSION_1_1));
 }
 
+
+
 int HWComposer::fbPost(int32_t id,
         const sp<Fence>& acquireFence, const sp<GraphicBuffer>& buffer) {
-    if (mHwc && hwcHasApiVersion(mHwc, HWC_DEVICE_API_VERSION_1_1)) {
-        return setFramebufferTarget(id, acquireFence, buffer);
+
+    bool fbcmp = mFlinger->mUseLcdcComposer ? !hasGlesComposition(id):true;    
+
+    if (mHwc && hwcHasApiVersion(mHwc, HWC_DEVICE_API_VERSION_1_1)
+        //#ifdef USE_LCDC_COMPOSER
+        && fbcmp
+        //#endif
+       ) {
+       return setFramebufferTarget(id, acquireFence, buffer);
     } else {
-        acquireFence->waitForever("HWComposer::fbPost");
-        return mFbDev->post(mFbDev, buffer->handle);
+        DisplayData& disp(mDisplayData[id]);    
+        if (!mHwc || !disp.list->skipflag) 
+        {
+          if (acquireFence!=NULL)
+          {
+            acquireFence->waitForever("HWComposer::fbPost");
+          }
+            return mFbDev->post(mFbDev, buffer->handle);
+        }    
+        else
+            return NO_ERROR;
     }
 }
 
 int HWComposer::fbCompositionComplete() {
     if (mHwc && hwcHasApiVersion(mHwc, HWC_DEVICE_API_VERSION_1_1))
+    {
+        glFinish();
         return NO_ERROR;
-
+    }
     if (mFbDev->compositionComplete) {
         return mFbDev->compositionComplete(mFbDev);
     } else {
@@ -910,13 +966,29 @@ public:
     virtual void setTransform(uint32_t transform) {
         getLayer()->transform = transform;
     }
+    virtual void setRealTransform(uint32_t realtransform) {
+        getLayer()->realtransform = realtransform;
+    }    
     virtual void setFrame(const Rect& frame) {
         getLayer()->displayFrame = reinterpret_cast<hwc_rect_t const&>(frame);
     }
     virtual void setCrop(const FloatRect& crop) {
         if (hwcHasApiVersion(mHwc, HWC_DEVICE_API_VERSION_1_3)) {
+            #if 0
             getLayer()->sourceCropf = reinterpret_cast<hwc_frect_t const&>(crop);
-        } else {
+            hwc_rect_t& r = getLayer()->sourceCrop;
+            r.left  = int(ceilf(crop.left));
+            r.top   = int(ceilf(crop.top));
+            r.right = int(floorf(crop.right));
+            r.bottom= int(floorf(crop.bottom));
+            #else
+            hwc_rect_t& r = getLayer()->sourceCrop;
+            r.left  = int(ceilf(crop.left));
+            r.top   = int(ceilf(crop.top));
+            r.right = int(floorf(crop.right));
+            r.bottom= int(floorf(crop.bottom));   
+            #endif
+		} else {
             /*
              * Since h/w composer didn't support a flot crop rect before version 1.3,
              * using integer coordinates instead produces a different output from the GL code in
@@ -960,6 +1032,15 @@ public:
 
         getLayer()->acquireFenceFd = -1;
     }
+
+    virtual void setLayername(const char *layername) {
+        int strlens ;
+        strlens = strlen(layername);
+       strlens = strlens > LayerNameLength ? LayerNameLength:strlens;
+       memcpy(getLayer()->LayerName,layername,strlens);
+       getLayer()->LayerName[strlens] = 0;
+    }
+    
 };
 
 /*
@@ -1056,7 +1137,10 @@ void HWComposer::dump(String8& result) const {
                             "HWC",
                             "BACKGROUND",
                             "FB TARGET",
-                            "UNKNOWN"};
+                            "HWC_TOWIN0",
+                            "HWC_TOWIN1",
+                            "HWC_LCDC",
+                            "blit"};
                     if (type >= NELEM(compositionTypeName))
                         type = NELEM(compositionTypeName) - 1;
 

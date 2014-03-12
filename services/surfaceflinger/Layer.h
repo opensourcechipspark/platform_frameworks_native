@@ -132,10 +132,13 @@ public:
     bool setCrop(const Rect& crop);
     bool setLayerStack(uint32_t layerStack);
 
+    void setDrawingScreenshot(bool drawScreenshot) { mDrawingScreenshot = drawScreenshot; };
+
     uint32_t getTransactionFlags(uint32_t flags);
     uint32_t setTransactionFlags(uint32_t flags);
 
     void computeGeometry(const sp<const DisplayDevice>& hw, Mesh& mesh) const;
+    void computeHWGeometry(Transform& tr, const Transform& layerTransform, const sp<const DisplayDevice>& hw) const;
     Rect computeBounds() const;
 
     sp<IBinder> getHandle();
@@ -151,6 +154,7 @@ public:
      * isOpaque - true if this surface is opaque
      */
     virtual bool isOpaque() const;
+    virtual void ReleaseOldBuffer();    //rk : for lcdc composer
 
     /*
      * isSecure - true if this surface is secure, that is if it prevents
@@ -358,6 +362,9 @@ private:
     bool mFiltering;
     // Whether filtering is needed b/c of the drawingstate
     bool mNeedsFiltering;
+
+    bool mDrawingScreenshot;
+    uint32_t    mLastRealtransform;
     // The mesh used to draw the layer in GLES composition mode
     mutable Mesh mMesh;
     // The mesh used to draw the layer in GLES composition mode

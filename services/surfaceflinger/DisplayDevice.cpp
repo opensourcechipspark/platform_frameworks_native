@@ -48,6 +48,7 @@ using namespace android;
  * Initialize the display to the specified values.
  *
  */
+static PFNEGLRENDERBUFFERMODIFYEDANDROIDPROC _eglRenderBufferModifiedANDROID;
 
 DisplayDevice::DisplayDevice(
         const sp<SurfaceFlinger>& flinger,
@@ -57,7 +58,8 @@ DisplayDevice::DisplayDevice(
         const wp<IBinder>& displayToken,
         const sp<DisplaySurface>& displaySurface,
         const sp<IGraphicBufferProducer>& producer,
-        EGLConfig config)
+        EGLConfig config,
+        int hardwareOrientation)
     : mFlinger(flinger),
       mType(type), mHwcDisplayId(hwcId),
       mDisplayToken(displayToken),
@@ -71,7 +73,8 @@ DisplayDevice::DisplayDevice(
       mSecureLayerVisible(false),
       mScreenAcquired(false),
       mLayerStack(NO_LAYER_STACK),
-      mOrientation()
+      mOrientation(),
+      mHardwareOrientation(hardwareOrientation)
 {
     mNativeWindow = new Surface(producer, false);
     ANativeWindow* const window = mNativeWindow.get();
@@ -107,6 +110,9 @@ DisplayDevice::DisplayDevice(
     mViewport.makeInvalid();
     mFrame.makeInvalid();
 
+    mViewport.set(bounds());
+    mFrame.set(bounds());
+
     // virtual displays are always considered enabled
     mScreenAcquired = (mType >= DisplayDevice::DISPLAY_VIRTUAL);
 
@@ -126,6 +132,8 @@ DisplayDevice::DisplayDevice(
 
     // initialize the display orientation transform.
     setProjection(DisplayState::eOrientationDefault, mViewport, mFrame);
+	_eglRenderBufferModifiedANDROID = (PFNEGLRENDERBUFFERMODIFYEDANDROIDPROC)
+                                    eglGetProcAddress("eglRenderBufferModifiedANDROID");
 }
 
 DisplayDevice::~DisplayDevice() {
@@ -198,6 +206,12 @@ void DisplayDevice::flip(const Region& dirty) const
     mPageFlipCount++;
 }
 
+void DisplayDevice::hwcSwapBuffers() const
+{
+    _eglRenderBufferModifiedANDROID(mDisplay, mSurface);
+    eglSwapBuffers(mDisplay, mSurface);
+}
+
 status_t DisplayDevice::beginFrame() const {
     return mDisplaySurface->beginFrame();
 }
@@ -244,7 +258,6 @@ void DisplayDevice::swapBuffers(HWComposer& hwc) const {
             }
         }
     }
-
     status_t result = mDisplaySurface->advanceFrame();
     if (result != NO_ERROR) {
         ALOGE("[%s] failed pushing new frame to HWC: %d",
@@ -392,10 +405,16 @@ void DisplayDevice::setProjection(int orientation,
     Rect viewport(newViewport);
     Rect frame(newFrame);
 
+    if (mType == DisplayDevice::DISPLAY_PRIMARY) {
+        mClientOrientation = orientation;
+        orientation = (mHardwareOrientation +orientation) % 4;
+
+    }
+
     const int w = mDisplayWidth;
     const int h = mDisplayHeight;
 
-    Transform R;
+    Transform R, realR;
     DisplayDevice::orientationToTransfrom(orientation, w, h, &R);
 
     if (!frame.isValid()) {
@@ -442,6 +461,11 @@ void DisplayDevice::setProjection(int orientation,
     // physical translation and finally rotate to the physical orientation.
     mGlobalTransform = R * TP * S * TL;
 
+    if (DisplayDevice::orientationToTransfrom(
+            mClientOrientation, w, h, &realR) == NO_ERROR) {
+        mRealGlobalTransform = realR * TP * S * TL;
+    }
+
     const uint8_t type = mGlobalTransform.getType();
     mNeedsFiltering = (!mGlobalTransform.preserveRects() ||
             (type >= Transform::SCALE));
@@ -458,22 +482,27 @@ void DisplayDevice::setProjection(int orientation,
 
 void DisplayDevice::dump(String8& result) const {
     const Transform& tr(mGlobalTransform);
+    const Transform& realTR(mRealGlobalTransform);
     result.appendFormat(
         "+ DisplayDevice: %s\n"
-        "   type=%x, hwcId=%d, layerStack=%u, (%4dx%4d), ANativeWindow=%p, orient=%2d (type=%08x), "
+        "   type=%x, hwcId=%d, layerStack=%u, (%4dx%4d), ANativeWindow=%p, orient=%2d clienOrient=%2d (type=%08x), "
         "flips=%u, isSecure=%d, secureVis=%d, acquired=%d, numLayers=%u\n"
         "   v:[%d,%d,%d,%d], f:[%d,%d,%d,%d], s:[%d,%d,%d,%d],"
-        "transform:[[%0.3f,%0.3f,%0.3f][%0.3f,%0.3f,%0.3f][%0.3f,%0.3f,%0.3f]]\n",
+        "transform:[[%0.3f,%0.3f,%0.3f][%0.3f,%0.3f,%0.3f][%0.3f,%0.3f,%0.3f]]\n"
+        "   real transform:[[%0.3f,%0.3f,%0.3f][%0.3f,%0.3f,%0.3f][%0.3f,%0.3f,%0.3f]]\n",
         mDisplayName.string(), mType, mHwcDisplayId,
         mLayerStack, mDisplayWidth, mDisplayHeight, mNativeWindow.get(),
-        mOrientation, tr.getType(), getPageFlipCount(),
+        mOrientation, mClientOrientation, tr.getType(), getPageFlipCount(),
         mIsSecure, mSecureLayerVisible, mScreenAcquired, mVisibleLayersSortedByZ.size(),
         mViewport.left, mViewport.top, mViewport.right, mViewport.bottom,
         mFrame.left, mFrame.top, mFrame.right, mFrame.bottom,
         mScissor.left, mScissor.top, mScissor.right, mScissor.bottom,
         tr[0][0], tr[1][0], tr[2][0],
         tr[0][1], tr[1][1], tr[2][1],
-        tr[0][2], tr[1][2], tr[2][2]);
+        tr[0][2], tr[1][2], tr[2][2],
+        realTR[0][0], realTR[1][0], realTR[2][0],
+        realTR[0][1], realTR[1][1], realTR[2][1],
+        realTR[0][2], realTR[1][2], realTR[2][2]);
 
     String8 surfaceDump;
     mDisplaySurface->dump(surfaceDump);

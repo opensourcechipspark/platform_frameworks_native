@@ -28,6 +28,15 @@
 #include <ui/GraphicBufferMapper.h>
 #include <ui/PixelFormat.h>
 
+#ifdef TARGET_BOARD_PLATFORM_RK30XXB
+#include <pthread.h>
+#include <hardware/hal_public.h>
+#define private_handle_t IMG_native_handle_t
+extern int gRsBufBase ;
+static buffer_handle_t pre_free_handle[4] = {0,};
+static int pre_free_count = 0;
+pthread_mutex_t s_gb_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 namespace android {
 
 // ===========================================================================
@@ -102,7 +111,32 @@ void GraphicBuffer::free_handle()
         native_handle_delete(const_cast<native_handle*>(handle));
     } else if (mOwner == ownData) {
         GraphicBufferAllocator& allocator(GraphicBufferAllocator::get());
+#ifdef TARGET_BOARD_PLATFORM_RK30XXB
+        struct private_handle_t* srchnd =  (struct private_handle_t *)handle;
+	   	pthread_mutex_lock(&s_gb_lock);
+	    if( srchnd->iBase == gRsBufBase )
+	    {
+	        if(  pre_free_count < 4)
+	        {
+    	        pre_free_handle[pre_free_count] = handle;
+        	    ALOGD(" Dont really free handle base=%p",srchnd->iBase);
+        	}
+        	else
+        	{
+                struct private_handle_t* temchnp =(struct private_handle_t *)pre_free_handle[pre_free_count%4];
+                ALOGD(" Force free last  pre_free_handle[%d]=%p ",pre_free_count%4,temchnp->iBase);
+                allocator.free( pre_free_handle[pre_free_count%4]);
+                pre_free_handle[pre_free_count%4] = handle;
+        	}
+            pre_free_count ++;
+            gRsBufBase = 0;
+	    }
+	    else
+            allocator.free(handle);
+	    pthread_mutex_unlock(&s_gb_lock);
+#else
         allocator.free(handle);
+#endif
     }
     mWrappedBuffer = 0;
 }

@@ -33,13 +33,42 @@
 #include <gui/Surface.h>
 
 #include <private/gui/ComposerService.h>
+#include <cutils/properties.h>
+
+#ifdef USE_LCDC_COMPOSER
+#include <hardware/rga.h>
+#include <fcntl.h>
+#endif
+#include <cutils/properties.h>
 
 namespace android {
+static int UseLcdcComposer = 0;
+static int ModFormatProg = 0;
+char* GetProgramName(char* buf, int size)
+{
+    char procName[64];
+    pid_t pid = getpid();
+    FILE* fp = NULL;
+    snprintf(procName, sizeof(procName), "/proc/%i/cmdline", pid);
+    fp = fopen(procName, "r");
+    if(fp)
+    {
+        fread(buf, 1, size, fp);
+        fclose(fp);
+        fp = NULL;
+    }
+    else
+    {
+        ALOGD("%s : %d : open file %s failed \n", __FUNCTION__, __LINE__, procName);
+    }
+    return buf;
+}
 
 Surface::Surface(
         const sp<IGraphicBufferProducer>& bufferProducer,
         bool controlledByApp)
     : mGraphicBufferProducer(bufferProducer)
+    ,shouldchange(false)
 {
     // Initialize the ANativeWindow function pointers.
     ANativeWindow::setSwapInterval  = hook_setSwapInterval;
@@ -74,6 +103,20 @@ Surface::Surface(
     mConnectedToCpu = false;
     mProducerControlledByApp = controlledByApp;
     mSwapIntervalZero = false;
+    char value[PROPERTY_VALUE_MAX];
+    property_get("ro.sf.lcdc_composer", value, "0");
+    UseLcdcComposer = atoi(value);
+    //UseLcdcComposer = 1;
+    if(UseLcdcComposer) {
+        char exeName[64] = {0};
+        GetProgramName(exeName, 64 - 1);
+        if(0 == strcmp("com.android.browser", exeName)) {
+            ModFormatProg = 1;
+        }
+        else {
+            ModFormatProg = 0;
+        }
+    }
 }
 
 Surface::~Surface() {
@@ -182,6 +225,39 @@ int Surface::dequeueBuffer(android_native_buffer_t** buffer, int* fenceFd) {
     int buf = -1;
     int reqW = mReqWidth ? mReqWidth : mUserWidth;
     int reqH = mReqHeight ? mReqHeight : mUserHeight;
+    if(UseLcdcComposer) {
+        switch(ModFormatProg)
+        {
+        case 1: //com.android.browser
+            if(reqW==0 && reqH==0) {
+                int isBrowserActivity = 0;
+                mGraphicBufferProducer->query(1000, &isBrowserActivity);
+                if(isBrowserActivity) {
+                    static int MaxWidth = 0, MaxHeight = 0;
+                    if(mDefaultWidth > MaxWidth)    MaxWidth = mDefaultWidth;
+                    if(mDefaultHeight > MaxHeight)  MaxHeight = mDefaultHeight;
+                    if(mDefaultWidth==MaxWidth || mDefaultHeight==MaxHeight) {
+                        char value[PROPERTY_VALUE_MAX];
+                        property_get("sys.video.fullscreen", value, "0");
+                        if(atoi(value)==0) {
+                            if(mReqFormat == 1)  mReqFormat = 4;
+                        } else {
+                            if(mReqFormat == 4)  mReqFormat = 1;
+                        }
+                    }
+                }
+            }
+            break;      
+        default:
+            break;
+        }
+    }
+#ifdef USE_LCDC_COMPOSER
+	 if(shouldchange){
+        reqW = -1;
+        reqH = -2;
+    }
+#endif
     sp<Fence> fence;
     status_t result = mGraphicBufferProducer->dequeueBuffer(&buf, &fence, mSwapIntervalZero,
             reqW, reqH, mReqFormat, mReqUsage);
@@ -663,7 +739,9 @@ void Surface::freeAllBuffers() {
 
 // ----------------------------------------------------------------------
 // the lock/unlock APIs must be used from the same thread
-
+#ifdef USE_LCDC_COMPOSER
+static int fd_rga = -1;
+#endif
 static status_t copyBlt(
         const sp<GraphicBuffer>& dst,
         const sp<GraphicBuffer>& src,
@@ -680,6 +758,7 @@ static status_t copyBlt(
     err = dst->lock(GRALLOC_USAGE_SW_WRITE_OFTEN, reg.bounds(), (void**)&dst_bits);
     ALOGE_IF(err, "error locking dst buffer %s", strerror(-err));
 
+#ifndef USE_LCDC_COMPOSER
     Region::const_iterator head(reg.begin());
     Region::const_iterator tail(reg.end());
     if (head != tail && src_bits && dst_bits) {
@@ -706,6 +785,121 @@ static status_t copyBlt(
         }
     }
 
+#else
+    int32_t vir_w = 0, vir_h = 0;
+    Region::const_iterator head_(reg.begin());
+    Region::const_iterator tail_(reg.end());
+    if (head_ != tail_ && src_bits && dst_bits) {
+        while (head_ != tail_) {
+            const Rect& r(*head_++);
+            ssize_t h_ = r.height();
+            if (h_ <= 0) continue;
+            int32_t tmp_w = r.right;
+            int32_t tmp_h = r.bottom;
+            vir_w = (vir_w >= tmp_w) ? vir_w : tmp_w;
+            vir_h = (vir_h >= tmp_h) ? vir_h : tmp_h;
+        }
+    }
+    head_ = reg.begin();
+    if (head_ != tail_ && src_bits && dst_bits) {
+        //const size_t bpp = bytesPerPixel(src->format);
+        bool needsync = false;
+        struct rga_req  Rga_Request;
+        if(fd_rga < 0){
+            property_set("sys.gui.version", "1.04");
+            fd_rga = open("/dev/rga",O_RDWR,0);
+            if(fd_rga < 0){
+                ALOGE(" rga open err");
+                goto ERROR;
+            }
+        }
+        while (head_ != tail_) {
+            if(needsync){
+                if(ioctl(fd_rga, RGA_BLIT_ASYNC, &Rga_Request) != 0){
+                    ALOGE("              rga ioctl  RGA_BLIT_ASYNC  err !!!!!!    fd_rga = %d", fd_rga);
+                    goto ERROR;
+                }
+            }
+            const Rect& r(*head_++);
+            ssize_t h = r.height();
+            if (h <= 0) continue;
+
+            memset(&Rga_Request,0x0,sizeof(Rga_Request));
+            //set src info
+            Rga_Request.src.yrgb_addr =  (int)src_bits; //(int)s;
+            Rga_Request.src.uv_addr  = 0;
+            Rga_Request.src.v_addr   =  Rga_Request.src.uv_addr;
+            Rga_Request.src.vir_w = src->stride;
+            Rga_Request.src.vir_h = vir_h;
+            Rga_Request.src.format = 0x0;               // RK_FORMAT_RGBA_8888
+            Rga_Request.src.act_w = r.width();
+            Rga_Request.src.act_h = r.height();
+            Rga_Request.src.x_offset = r.left;
+            Rga_Request.src.y_offset = r.top;
+
+            //set dst info
+            Rga_Request.dst.yrgb_addr = (int)dst_bits;  //(int)d;
+            Rga_Request.dst.uv_addr  = 0;
+            Rga_Request.dst.v_addr   = Rga_Request.dst.uv_addr;
+            Rga_Request.dst.vir_w = dst->stride;
+            Rga_Request.dst.vir_h = vir_h;
+            Rga_Request.dst.act_w = r.width();
+            Rga_Request.dst.act_h = r.height();
+            Rga_Request.clip.xmin = 0;
+            Rga_Request.clip.xmax = Rga_Request.dst.vir_w - 1;
+            Rga_Request.clip.ymin = 0;
+            Rga_Request.clip.ymax = Rga_Request.dst.vir_h - 1;
+            Rga_Request.dst.x_offset = r.left;
+            Rga_Request.dst.y_offset = r.top;
+            
+            Rga_Request.sina = 0;
+            Rga_Request.cosa = 0x10000;
+            Rga_Request.dst.format = 0x0;               // RK_FORMAT_RGBA_8888
+
+            Rga_Request.alpha_rop_flag |= (1 << 5);
+
+            Rga_Request.mmu_info.mmu_en    = 1;
+            Rga_Request.mmu_info.mmu_flag  = ((2 & 0x3) << 4) | 1;
+
+            needsync = true;
+        }
+        if(needsync){
+            if(ioctl(fd_rga, RGA_BLIT_ASYNC, &Rga_Request) != 0){
+                ALOGE("          %s(%d):  RGA_BLIT_ASYNC Failed  err !!!!!!     fd_rga = %d ", __FUNCTION__, __LINE__, fd_rga);
+                ALOGE("          src info: yrgb_addr=%x, uv_addr=%x,v_addr=%x,"
+                 "vir_w=%d,vir_h=%d,format=%d,"
+                 "act_x_y_w_h [%d,%d,%d,%d] ",
+                                Rga_Request.src.yrgb_addr, Rga_Request.src.uv_addr ,Rga_Request.src.v_addr,
+                                Rga_Request.src.vir_w ,Rga_Request.src.vir_h ,Rga_Request.src.format ,
+                                Rga_Request.src.x_offset ,
+                                Rga_Request.src.y_offset,
+                                Rga_Request.src.act_w ,
+                                Rga_Request.src.act_h
+
+                );
+
+                ALOGE("          dst info: yrgb_addr=%x, uv_addr=%x,v_addr=%x,"
+                 "vir_w=%d,vir_h=%d,format=%d,"
+                 "clip[%d,%d,%d,%d], "
+                 "act_x_y_w_h [%d,%d,%d,%d] ",
+                                Rga_Request.dst.yrgb_addr, Rga_Request.dst.uv_addr ,Rga_Request.dst.v_addr,
+                                Rga_Request.dst.vir_w ,Rga_Request.dst.vir_h ,Rga_Request.dst.format,
+                                Rga_Request.clip.xmin,
+                                Rga_Request.clip.xmax,
+                                Rga_Request.clip.ymin,
+                                Rga_Request.clip.ymax,
+                                Rga_Request.dst.x_offset ,
+                                Rga_Request.dst.y_offset,
+                                Rga_Request.dst.act_w ,
+                                Rga_Request.dst.act_h
+
+                );
+               goto ERROR;
+            }
+        }
+    }
+ERROR:
+#endif
     if (src_bits)
         src->unlock();
 
@@ -716,6 +910,33 @@ static status_t copyBlt(
 }
 
 // ----------------------------------------------------------------------------
+status_t Surface::changehw(int rotation)
+{
+#ifdef USE_LCDC_COMPOSER
+    switch(rotation){
+        case 1:	// 0:
+            mTransform = 7;	//Transform::ROT_90 == 4; Transform::ROT_270 == 7;
+            shouldchange = true;
+            break;
+        case 3:	// 2:
+            mTransform = 4;	//Transform::ROT_90 == 4; Transform::ROT_270 == 7;
+            shouldchange = true;
+            break;
+        case 2:	// 3:
+            mTransform = 3;	//Transform::ROT_180 == 3;
+            shouldchange = false;
+            break;
+        case 0: // 1:
+            mTransform = 0;
+            shouldchange = false;
+            break;
+	    default:
+		    mTransform = 0;
+            shouldchange = false;
+    }
+#endif
+    return INVALID_OPERATION;
+}
 
 status_t Surface::lock(
         ANativeWindow_Buffer* outBuffer, ARect* inOutDirtyBounds)
@@ -750,9 +971,33 @@ status_t Surface::lock(
         }
 
         const Rect bounds(backBuffer->width, backBuffer->height);
-
         Region newDirtyRegion;
         if (inOutDirtyBounds) {
+#ifdef USE_LCDC_COMPOSER
+            int32_t tmp_l = inOutDirtyBounds->left;
+            int32_t tmp_r = inOutDirtyBounds->right;
+            int32_t tmp_t = inOutDirtyBounds->top;
+            int32_t tmp_b = inOutDirtyBounds->bottom;
+            if(mTransform == 4){
+                inOutDirtyBounds->left = tmp_t;
+                inOutDirtyBounds->right = tmp_b;
+                inOutDirtyBounds->top = backBuffer->height - tmp_r;
+                inOutDirtyBounds->bottom = backBuffer->height - tmp_l;
+            }
+            if(mTransform == 3){
+                inOutDirtyBounds->left = backBuffer->width - tmp_r;
+                inOutDirtyBounds->right = backBuffer->width - tmp_l;
+                inOutDirtyBounds->top = backBuffer->height - tmp_b;
+                inOutDirtyBounds->bottom = backBuffer->height - tmp_t;
+            }
+            if(mTransform == 7){
+                inOutDirtyBounds->left = backBuffer->width - tmp_b;
+                inOutDirtyBounds->right = backBuffer->width - tmp_t;;
+                inOutDirtyBounds->top = tmp_l;
+                inOutDirtyBounds->bottom = tmp_r;
+            }
+#endif
+
             newDirtyRegion.set(static_cast<Rect const&>(*inOutDirtyBounds));
             newDirtyRegion.andSelf(bounds);
         } else {
@@ -836,6 +1081,13 @@ status_t Surface::unlockAndPost()
 
     mPostedBuffer = mLockedBuffer;
     mLockedBuffer = 0;
+#ifdef USE_LCDC_COMPOSER
+    if(fd_rga != -1){
+        if(ioctl(fd_rga, RGA_FLUSH, NULL) != 0) {
+            ALOGE("unlockAndPost RGA_FLUSH err,   fd_rga: %d,  err: %d ", fd_rga, err);
+        }
+    }
+#endif
     return err;
 }
 
