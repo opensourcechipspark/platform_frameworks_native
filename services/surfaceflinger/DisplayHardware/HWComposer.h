@@ -21,6 +21,7 @@
 #include <sys/types.h>
 
 #include <hardware/hwcomposer_defs.h>
+#include <hardware/hwcomposer.h>
 
 #include <ui/Fence.h>
 
@@ -98,6 +99,8 @@ public:
     status_t layerRecover();
     status_t setSkipFrame(  uint32_t skipflag ) ;
 
+	status_t videoCopyBit(hwc_layer_1_t* hwcLayer, int flag);
+
     // release hardware resources and blank screen
     status_t release(int disp);
 
@@ -118,10 +121,18 @@ public:
     // does this display have layers handled by GLES
     bool hasGlesComposition(int32_t id) const;
 
+    // rk: does this display have layers handled by Blit (rga)
+    bool hasBlitComposition(int32_t id) const;
+
     bool hasLcdComposition(int32_t id) const;
     // get the releaseFence file descriptor for a display's framebuffer layer.
     // the release fence is only valid after commit()
     sp<Fence> getAndResetReleaseFence(int32_t id);
+
+#ifdef TARGET_BOARD_PLATFORM_RK30XXB
+    //zxl:count fps for SGX540
+    status_t fbs_post(void);
+#endif
 
     // needed forward declarations
     class LayerListIterator;
@@ -160,6 +171,7 @@ public:
         virtual int32_t getCompositionType() const = 0;
         virtual uint32_t getHints() const = 0;
         virtual sp<Fence> getAndResetReleaseFence() = 0;
+        virtual hwc_layer_1_t* gethwcLayer() = 0;
         virtual void setDefaultState() = 0;
         virtual void setSkip(bool skip) = 0;
         virtual void setBlending(uint32_t blending) = 0;
@@ -321,6 +333,7 @@ private:
         nsecs_t refresh;
         bool connected;
         bool hasFbComp;
+        bool hasBlitComp;
         bool hasOvComp;
         bool haslcdComp;
         size_t capacity;

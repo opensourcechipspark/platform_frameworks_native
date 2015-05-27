@@ -115,6 +115,9 @@ static const TracingCategory k_categories[] = {
     { "workq",      "Kernel Workqueues", 0, {
         { REQ,      "/sys/kernel/debug/tracing/events/workqueue/enable" },
     } },
+    { "ion",        "ion commands", 0, {
+        { REQ,      "/sys/kernel/debug/tracing/events/ion/enable" },
+    } },
 };
 
 /* Command line options */

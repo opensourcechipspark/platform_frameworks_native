@@ -63,6 +63,10 @@ ifneq ($(MAX_EGL_CACHE_SIZE),)
   LOCAL_CFLAGS += -DMAX_EGL_CACHE_SIZE=$(MAX_EGL_CACHE_SIZE)
 endif
 
+ifeq ($(strip $(TARGET_BOARD_PLATFORM)),rk3288)
+	LOCAL_CFLAGS += -DUSE_IN_RK3288
+endif
+
 LOCAL_REQUIRED_MODULES := $(egl.cfg_config_module)
 egl.cfg_config_module :=
 

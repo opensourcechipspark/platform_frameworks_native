@@ -500,9 +500,11 @@ private:
 
     Daltonizer mDaltonizer;
     bool mDaltonize;
-    int     mDebugFPS;
-    int mcapFlag;
+    int mDebugFPS;
 
+    // add by rk for workwround some display issue.
+    int mSkipFlag;
+    int mDelayFlag;
 };
 
 }; // namespace android

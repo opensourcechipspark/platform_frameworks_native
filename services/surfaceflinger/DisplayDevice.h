@@ -187,7 +187,7 @@ private:
     mutable uint32_t mPageFlipCount;
     String8         mDisplayName;
     bool            mIsSecure;
-
+    bool            mIsRk3128;      //rk soc info
     /*
      * Can only accessed from the main thread, these members
      * don't need synchronization.

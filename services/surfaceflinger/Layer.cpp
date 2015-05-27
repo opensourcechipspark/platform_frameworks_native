@@ -360,6 +360,9 @@ FloatRect Layer::computeCrop(const sp<const DisplayDevice>& hw) const {
     return crop;
 }
 
+
+static int fd_dvfs = -1;
+static int dvfs_stat = 0;
 void Layer::setGeometry(
     const sp<const DisplayDevice>& hw,
         HWComposer::HWCLayerInterface& layer)
@@ -375,6 +378,13 @@ void Layer::setGeometry(
 
     // this gives us only the "orientation" component of the transform
     const State& s(getDrawingState());
+   
+#ifndef USE_LCDC_COMPOSER    
+    if (s.alpha < 0xFF) {
+        layer.setSkip(true);   // 32lcdc can support ,so it dont skip
+    } 
+#endif    
+
     if (!isOpaque() || s.alpha != 0xFF) {
         layer.setBlending( (mPremultipliedAlpha ?
                 HWC_BLENDING_PREMULT :
@@ -419,8 +429,20 @@ void Layer::setGeometry(
     const uint32_t orientation = transform.getOrientation();
     if (orientation & Transform::ROT_INVALID) {
         // we can only handle simple transformation
+        if(fd_dvfs < 0)
+            fd_dvfs = open("/sys/devices/ffa30000.gpu/dvfs", O_RDWR, 0);   
+        if(fd_dvfs > 0 && dvfs_stat == 0)    
+        {         
+            write(fd_dvfs,"off",3);  
+            dvfs_stat = 1;
+        }                
         layer.setSkip(true);
     } else {
+        if(fd_dvfs > 0 && dvfs_stat == 1)    
+        {                   
+            write(fd_dvfs,"on",2);
+           dvfs_stat = 0;
+        }                
         uint32_t realtransform = (hw->getTransform(false) * s.transform * bufferOrientation).getOrientation();
         layer.setTransform(orientation);
         if(mFlinger->mUseLcdcComposer )
@@ -466,7 +488,9 @@ void Layer::setAcquireFence(const sp<const DisplayDevice>& hw,
     // acquire fence the first time a new buffer is acquired on EACH display.
 
    // if (layer.getCompositionType() == HWC_OVERLAY || layer.getCompositionType()==100) {
+#ifndef USE_PREPARE_FENCE
         if (layer.getCompositionType() != HWC_FRAMEBUFFER) {   
+#endif
         sp<Fence> fence = mSurfaceFlingerConsumer->getCurrentFence();
         if (fence->isValid()) {
             fenceFd = fence->dup();
@@ -474,7 +498,11 @@ void Layer::setAcquireFence(const sp<const DisplayDevice>& hw,
                 ALOGW("failed to dup layer fence, skipping sync: %d", errno);
             }
         }
+#ifndef USE_PREPARE_FENCE
     }
+#else
+	ALOGV("isValid=%d,fenceFd=%d,name=%s",fence->isValid(),fenceFd,getName().string());
+#endif
     layer.setAcquireFenceFd(fenceFd);
 }
 
@@ -493,7 +521,6 @@ void Layer::draw(const sp<const DisplayDevice>& hw) {
 void Layer::onDraw(const sp<const DisplayDevice>& hw, const Region& clip) const
 {
     ATRACE_CALL();
-
     if (CC_UNLIKELY(mActiveBuffer == 0)) {
         // the texture has not been created yet, this Layer has
         // in fact never been drawn into. This happens frequently with
@@ -519,6 +546,7 @@ void Layer::onDraw(const sp<const DisplayDevice>& hw, const Region& clip) const
         if (!holes.isEmpty()) {
             clearWithOpenGL(hw, holes, 0, 0, 0, 1);
         }
+        
         return;
     }
 
@@ -581,6 +609,7 @@ void Layer::onDraw(const sp<const DisplayDevice>& hw, const Region& clip) const
     } else {
         engine.setupLayerBlackedOut();
     }
+    
     drawWithOpenGL(hw, clip);
     engine.disableTexturing();
 }
@@ -622,7 +651,10 @@ void Layer::drawWithOpenGL(
      * like more of a hack.
      */
     const Rect win(computeBounds());
-
+    //if (mDrawingScreenshot) {
+        //ALOGD("ro=%d,hw=%d,[%dx%d],name=%s", hw->getHardwareRotation(),
+         //mFlinger->getHardwareOrientation(),s.active.w,s.active.h,getName().string());
+    //}    
     float left   = float(win.left)   / float(s.active.w);
     float top    = float(win.top)    / float(s.active.h);
     float right  = float(win.right)  / float(s.active.w);

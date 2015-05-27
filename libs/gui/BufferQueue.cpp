@@ -108,11 +108,16 @@ BufferQueue::BufferQueue(const sp<IGraphicBufferAlloc>& allocator) :
     char value[PROPERTY_VALUE_MAX];
     property_get("ro.sf.lcdc_composer", value, "0");
     UseLcdcComposer = atoi(value);    
-	property_set("sys.glibgui", "1.001");
-
+	property_set("sys.glibgui.version", "1.0.1");
+ 
     property_get("sys.cts_gts.status", value, "0");
 
+#ifdef USE_RGA_COPYBLT
+    IsCTS = 0;
+#else    
     IsCTS =  !strcmp(value,"true");
+#endif
+    //
     if(IsCTS)
     {
         system("mkdir /data/virt_cts/");          
@@ -141,6 +146,11 @@ status_t BufferQueue::setDefaultMaxBufferCountLocked(int count) {
 void BufferQueue::setConsumerName(const String8& name) {
     Mutex::Autolock lock(mMutex);
     mConsumerName = name;
+#ifdef USE_GRALLOC_PRIVATE_FLAG
+    if (!strcmp(mConsumerName.string(), "SurfaceView")) {
+        mConsumerUsageBits |= GRALLOC_USAGE_PRIVATE_0;
+    }
+#endif
 }
 
 status_t BufferQueue::setDefaultBufferFormat(uint32_t defaultFormat) {
@@ -151,8 +161,8 @@ status_t BufferQueue::setDefaultBufferFormat(uint32_t defaultFormat) {
 
 status_t BufferQueue::setConsumerUsageBits(uint32_t usage) {
     Mutex::Autolock lock(mMutex);
-   // mConsumerUsageBits |= usage;
-		mConsumerUsageBits = usage;
+    mConsumerUsageBits |= usage;
+		//mConsumerUsageBits = usage;
     return NO_ERROR;
 }
 
@@ -286,6 +296,10 @@ status_t BufferQueue::dequeueBuffer(int *outBuf, sp<Fence>* outFence, bool async
         uint32_t w, uint32_t h, uint32_t format, uint32_t usage) {
     ATRACE_CALL();
     ST_LOGV("dequeueBuffer: w=%d h=%d fmt=%#x usage=%#x", w, h, format, usage);
+    if(strstr(mConsumerName.string(),"Starting@# "))
+    {
+        //format = 4;      
+    }
    // struct timeval tpend1, tpend2;
   //  long usec1 = 0;
 #ifdef USE_LCDC_COMPOSER
@@ -556,11 +570,17 @@ status_t BufferQueue::queueBuffer(int buf,
             char layername[64] ; 
             char cmd[64];
             int bpp = 4;
+			int div = 1;
             struct private_handle_t* buffhnd = (struct private_handle_t*)mSlots[buf].mGraphicBuffer->handle;
             if(HAL_PIXEL_FORMAT_RGB_565 == buffhnd->format)
                 bpp = 2;
             else if(HAL_PIXEL_FORMAT_RGB_888 == buffhnd->format)
                 bpp = 3;
+			if(HAL_PIXEL_FORMAT_YCrCb_NV12 == buffhnd->format)	 
+			{
+				div = 2;
+				bpp = 3;
+	 		}
 
            // ALOGD("dumpVirtual  write addr=%x,[%dx%d],fomt=%d,gvir_cnt=%d",buffhnd->base,buffhnd->width,buffhnd->height,buffhnd->format,gcts_bq.vir_cnt);
 
@@ -568,7 +588,7 @@ status_t BufferQueue::queueBuffer(int buf,
             pfile = fopen(layername,"wb");
             if(pfile)
             { 
-                fwrite(( void *)buffhnd->base,(size_t)(buffhnd->width * buffhnd->height *bpp ),1,pfile);
+                fwrite(( void *)buffhnd->base,(size_t)(buffhnd->width * buffhnd->height *bpp/div ),1,pfile);
                 fclose(pfile);
                 sprintf(cmd,"chmod 777 %s",layername);
                 system(cmd);    
@@ -656,6 +676,7 @@ status_t BufferQueue::queueBuffer(int buf,
             // when the queue is not empty, we need to look at the front buffer
             // state and see if we need to replace it.
             Fifo::iterator front(mQueue.begin());
+          #ifndef ENABLE_WFD_SKIP_FRAME
             if (front->mIsDroppable) 
             {
                 // buffer slot currently queued is marked free if still tracked
@@ -671,6 +692,14 @@ status_t BufferQueue::queueBuffer(int buf,
                 mQueue.push_back(item);
                 listener = mConsumerListener;
             }
+          #else
+              mSlots[front->mBuf].mBufferState = BufferSlot::FREE;
+             // reset the frame number of the freed buffer so that it is the first in
+             // line to be dequeued again.
+              mSlots[front->mBuf].mFrameNumber = 0;
+             // and we record the new buffer in the queued list
+             *front = item;
+          #endif
         }
 
         mBufferHasBeenQueued = true;
@@ -945,7 +974,15 @@ void BufferQueue::freeAllBuffersLocked() {
 status_t BufferQueue::acquireBuffer(BufferItem *buffer, nsecs_t expectedPresent) {
     ATRACE_CALL();
     Mutex::Autolock _l(mMutex);
-
+#if (defined(ENABLE_WFD_SKIP_FRAME) || defined(USE_LCDC_COMPOSER))
+    char value[PROPERTY_VALUE_MAX];
+    memset(value,0,PROPERTY_VALUE_MAX);
+    property_get("sys_graphic.wfdstatus", value, "false");
+    if (!strcmp(value,"true"))
+    {
+      usleep(5000);      
+    }    
+#endif
     // Check that the consumer doesn't currently have the maximum number of
     // buffers acquired.  We allow the max buffer count to be exceeded by one
     // buffer, so that the consumer can successfully set up the newly acquired
@@ -1058,6 +1095,7 @@ status_t BufferQueue::acquireBuffer(BufferItem *buffer, nsecs_t expectedPresent)
 
     if(IsCTS)
     {
+
         
         if(strstr(mConsumerName.string(),"unnamed")) 
         {
@@ -1066,11 +1104,17 @@ status_t BufferQueue::acquireBuffer(BufferItem *buffer, nsecs_t expectedPresent)
             char layername[64] ;
             char cmd[64]; 
             int bpp = 4; 
+            int div = 1;
             
             if(HAL_PIXEL_FORMAT_RGB_565 == buffhnd->format)
                 bpp = 2;
             else if(HAL_PIXEL_FORMAT_RGB_888 == buffhnd->format)
                 bpp = 3;
+           if(HAL_PIXEL_FORMAT_YCrCb_NV12 == buffhnd->format)   
+           	{
+           			div = 2;
+           			bpp = 3;
+           	}
             sprintf(layername,"/data/virt_cts/vir%d.bin",gcts_bq.uname_cnt);				
             pfile = fopen(layername,"rb"); 
             //ALOGD("dumpVirtual pfile=%p,name=%s",pfile,layername);
@@ -1078,7 +1122,7 @@ status_t BufferQueue::acquireBuffer(BufferItem *buffer, nsecs_t expectedPresent)
             {
                 //ALOGD("dumpVirtual  read addr=%x,[%dx%d],filename=%s,bpp=%d",buffhnd->base,buffhnd->width,buffhnd->height,layername,bpp);
 
-                fread(( void *)buffhnd->base,(size_t)( buffhnd->width * buffhnd->height *bpp ),1,pfile);
+                fread(( void *)buffhnd->base,(size_t)( buffhnd->width * buffhnd->height *bpp/div ),1,pfile);
                 fclose(pfile);
                 
                 //memcpy(( void *)((int)(buffhnd->base) + buffhnd->width * buffhnd->height / 2 ),( void *)buffhnd->base,(size_t)( buffhnd->width * buffhnd->height /2));

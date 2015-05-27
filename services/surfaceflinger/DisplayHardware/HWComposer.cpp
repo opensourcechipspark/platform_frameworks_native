@@ -589,6 +589,15 @@ status_t HWComposer::setFramebufferTarget(int32_t id,
     return NO_ERROR;
 }
 
+bool gTimeIsUp = false;
+sp<SurfaceFlinger> gFlinger = NULL;
+void timer_handler(int sig) {
+    if(sig == SIGALRM) {
+        gFlinger->repaintEverything();
+        gTimeIsUp = true;
+        ALOGV("  time up, send a refresh msg!");
+    }
+}
 status_t HWComposer::prepare() {
     for (size_t i=0 ; i<mNumDisplays ; i++) {
         DisplayData& disp(mDisplayData[i]);
@@ -622,7 +631,74 @@ status_t HWComposer::prepare() {
 
     int err = mHwc->prepare(mHwc, mNumDisplays, mLists);
     ALOGE_IF(err, "HWComposer: prepare failed (%s)", strerror(-err));
+#ifdef USE_LCDC_COMPOSER
+    if(true)
+#else
+    if(mFlinger->mUseLcdcComposer)
+#endif
+    {
+        DisplayData& disp(mDisplayData[0]);
+        if (disp.list) {
+            bool NeedRepaint = false;
+            int TotalSize = 0;
+            int OnlyTopUpdate = 0;
+            struct itimerval tv = {0};
 
+            if (gFlinger != mFlinger) {
+                gFlinger = mFlinger;
+                signal(SIGALRM, timer_handler);
+            }
+            for (size_t i=0 ; i<disp.list->numHwLayers ; i++) {
+                hwc_layer_1_t& l = disp.list->hwLayers[i];
+                hwc_rect_t const * rt = l.visibleRegionScreen.rects;
+				if (rt == NULL)
+				{
+				  return 0;
+				}
+                TotalSize += (rt->right - rt->left) * (rt->bottom - rt->top);
+                if ( l.compositionType == HWC_OVERLAY ||
+                     l.compositionType == HWC_LCDC )
+                {
+                    NeedRepaint = true;
+                }
+                if (l.bufferUpdate) {
+                    l.bufferUpdate = 0;
+                    bool IsSmallTop = !strcmp("StatusBar", l.LayerName);
+                    if(IsSmallTop) {
+                        int size = (rt->right - rt->left) * (rt->bottom - rt->top);
+                        IsSmallTop = (size < ((disp.width * disp.height)/4));
+                    }
+                    OnlyTopUpdate = (IsSmallTop && 0==OnlyTopUpdate) ? 1 : -1;
+                }
+            }
+            if (NeedRepaint) {
+                if(TotalSize < ((disp.width * disp.height * 5)/4)) {
+                    NeedRepaint = false;
+                }
+            }
+            if (NeedRepaint) {
+                if (gTimeIsUp || 1==OnlyTopUpdate) {
+                    if (gTimeIsUp)   gTimeIsUp = false;
+                    ALOGV("close timer & go gpu composer!");
+                    tv.it_value.tv_usec = 0;
+                    setitimer(ITIMER_REAL, &tv, NULL);
+                    hwc_layer_1_t& l = disp.list->hwLayers[0];
+                    l.flags |= HWC_SKIP_LAYER;
+                    mHwc->prepare(mHwc, mNumDisplays, mLists);
+                    l.flags &= ~HWC_SKIP_LAYER;
+                } else {
+                    tv.it_value.tv_usec = 500*1000;
+                    tv.it_value.tv_sec = 2;
+                    setitimer(ITIMER_REAL, &tv, NULL);
+                    ALOGV("reset timer!");
+                }
+            } else {
+                tv.it_value.tv_usec = 0;
+                setitimer(ITIMER_REAL, &tv, NULL);
+                ALOGV("close timer!");
+            }
+        }
+    }
     if (err == NO_ERROR) {
         // here we're just making sure that "skip" layers are set
         // to HWC_FRAMEBUFFER and we're also counting how many layers
@@ -634,6 +710,7 @@ status_t HWComposer::prepare() {
         for (size_t i=0 ; i<mNumDisplays ; i++) {
             DisplayData& disp(mDisplayData[i]);
             disp.hasFbComp = false;
+            disp.hasBlitComp = false;
             disp.hasOvComp = false;
             disp.haslcdComp = false;
             if (disp.list) {
@@ -644,8 +721,13 @@ status_t HWComposer::prepare() {
                     //        i, l.compositionType, l.handle);
 
                     if (l.flags & HWC_SKIP_LAYER) {
-                        l.compositionType = HWC_FRAMEBUFFER;
+                       // l.compositionType = HWC_FRAMEBUFFER;
                     }
+
+                    if(l.compositionType == HWC_BLITTER) {
+                        disp.hasBlitComp = true;
+                    }
+
                     if (l.compositionType == HWC_FRAMEBUFFER) {
                         disp.hasFbComp = true;
                     }
@@ -654,7 +736,7 @@ status_t HWComposer::prepare() {
                     }
                     if ( (l.compositionType == HWC_TOWIN0 || l.compositionType == HWC_TOWIN1) )
                     {
-                        if( mFlinger->mUseLcdcComposer)
+                       // if( mFlinger->mUseLcdcComposer)
                             disp.hasOvComp = true;                       
                         disp.haslcdComp = true;
                     }
@@ -682,6 +764,12 @@ bool HWComposer::hasGlesComposition(int32_t id) const {
     return mDisplayData[id].hasFbComp;
 }
 
+bool HWComposer::hasBlitComposition(int32_t id) const {
+    if (!mHwc || uint32_t(id)>31 || !mAllocatedDisplayIDs.hasBit(id))
+        return true;
+    return mDisplayData[id].hasBlitComp;
+}
+
 bool HWComposer::hasLcdComposition(int32_t id) const {
     if (uint32_t(id)>31 || !mAllocatedDisplayIDs.hasBit(id))
         return false;
@@ -702,6 +790,26 @@ sp<Fence> HWComposer::getAndResetReleaseFence(int32_t id) {
     }
     return fd >= 0 ? new Fence(fd) : Fence::NO_FENCE;
 }
+
+#ifdef TARGET_BOARD_PLATFORM_RK30XXB
+status_t HWComposer::fbs_post(void)
+{
+    static bool bSet=false;
+    if(!bSet)
+    {
+        property_set("sys.gpvr.fbs_post", "1");
+        bSet=true;
+    }
+
+    if(mFbDev)
+        return mFbDev->post(mFbDev,NULL);
+    else
+    {
+        ALOGE("%s:mFbDev is null",__func__);
+        return -1;
+    }
+}
+#endif
 
 status_t HWComposer::setSkipFrame(  uint32_t skipflag ) {
     int err = NO_ERROR;
@@ -763,6 +871,12 @@ status_t HWComposer::commit() {
     return (status_t)err;
 }
 
+status_t HWComposer::videoCopyBit(hwc_layer_1_t* hwcLayer,int flag)
+{
+    int err = mHwc->rkCopybit(mHwc, hwcLayer->handle, hwcLayer->handle, flag);
+    return (status_t)err;
+}
+
 status_t HWComposer::release(int disp) {
     LOG_FATAL_IF(disp >= VIRTUAL_DISPLAY_ID_BASE);
     if (mHwc) {
@@ -817,10 +931,11 @@ int HWComposer::fbPost(int32_t id,
     bool fbcmp = mFlinger->mUseLcdcComposer ? !hasGlesComposition(id):true;    
 
     if (mHwc && hwcHasApiVersion(mHwc, HWC_DEVICE_API_VERSION_1_1)
-        //#ifdef USE_LCDC_COMPOSER
+        #ifndef USE_PREPARE_FENCE
         && fbcmp
-        //#endif
+        #endif
        ) {
+       struct private_handle_t* handle=(struct private_handle_t*)(buffer->handle);
        return setFramebufferTarget(id, acquireFence, buffer);
     } else {
         DisplayData& disp(mDisplayData[id]);    
@@ -840,7 +955,7 @@ int HWComposer::fbPost(int32_t id,
 int HWComposer::fbCompositionComplete() {
     if (mHwc && hwcHasApiVersion(mHwc, HWC_DEVICE_API_VERSION_1_1))
     {
-        glFinish();
+        //glFinish();
         return NO_ERROR;
     }
     if (mFbDev->compositionComplete) {
@@ -913,6 +1028,7 @@ public:
     HWCLayerVersion1(struct hwc_composer_device_1* hwc, hwc_layer_1_t* layer)
         : Iterable<HWCLayerVersion1, hwc_layer_1_t>(layer), mHwc(hwc) { }
 
+
     virtual int32_t getCompositionType() const {
         return getLayer()->compositionType;
     }
@@ -923,6 +1039,10 @@ public:
         int fd = getLayer()->releaseFenceFd;
         getLayer()->releaseFenceFd = -1;
         return fd >= 0 ? new Fence(fd) : Fence::NO_FENCE;
+    }
+
+    virtual hwc_layer_1_t * gethwcLayer()  {
+        return ( hwc_layer_1_t *)getLayer();
     }
     virtual void setAcquireFenceFd(int fenceFd) {
         getLayer()->acquireFenceFd = fenceFd;
@@ -1140,6 +1260,7 @@ void HWComposer::dump(String8& result) const {
                             "HWC_TOWIN0",
                             "HWC_TOWIN1",
                             "HWC_LCDC",
+                            "HWC_NODRAW",
                             "blit"};
                     if (type >= NELEM(compositionTypeName))
                         type = NELEM(compositionTypeName) - 1;
@@ -1235,7 +1356,7 @@ HWComposer::DisplayData::DisplayData()
     xdpi(0.0f), ydpi(0.0f),
     refresh(0),
     connected(false),
-    hasFbComp(false), hasOvComp(false),
+    hasFbComp(false),hasBlitComp(false),hasOvComp(false),
     capacity(0), list(NULL),
     framebufferTarget(NULL), fbTargetHandle(0),
     lastRetireFence(Fence::NO_FENCE), lastDisplayFence(Fence::NO_FENCE),

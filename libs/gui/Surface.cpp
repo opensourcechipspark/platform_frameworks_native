@@ -35,10 +35,10 @@
 #include <private/gui/ComposerService.h>
 #include <cutils/properties.h>
 
-#ifdef USE_LCDC_COMPOSER
+
 #include <hardware/rga.h>
 #include <fcntl.h>
-#endif
+
 #include <cutils/properties.h>
 
 namespace android {
@@ -113,6 +113,13 @@ Surface::Surface(
         if(0 == strcmp("com.android.browser", exeName)) {
             ModFormatProg = 1;
         }
+      #ifdef USE_LCDC_COMPOSER
+        #ifdef USE_LAUNCHER2
+        else if(0 == strcmp("com.android.launcher", exeName)) {
+            ModFormatProg = 2;
+        }
+        #endif
+      #endif
         else {
             ModFormatProg = 0;
         }
@@ -247,7 +254,20 @@ int Surface::dequeueBuffer(android_native_buffer_t** buffer, int* fenceFd) {
                     }
                 }
             }
-            break;      
+            break;
+         case 2: //com.android.launcher
+            {
+                char value[PROPERTY_VALUE_MAX];
+                property_get("sys.launcher.drawer", value, "0");
+                if(atoi(value)==0) {
+                    if(mReqFormat == 4)  mReqFormat = 1;
+                } else {
+                    if(mReqFormat == 1)  mReqFormat = 4;
+                }
+               // mReqFormat = 4;
+            }
+            break;
+      
         default:
             break;
         }
@@ -739,9 +759,33 @@ void Surface::freeAllBuffers() {
 
 // ----------------------------------------------------------------------
 // the lock/unlock APIs must be used from the same thread
-#ifdef USE_LCDC_COMPOSER
-static int fd_rga = -1;
-#endif
+static int fd_rga=-1;
+
+int hwChangeRgaFormat( int fmt )
+{
+    switch (fmt)
+    {
+    case HAL_PIXEL_FORMAT_RGB_565:
+        return RK_FORMAT_RGB_565;
+    case HAL_PIXEL_FORMAT_RGB_888:
+        return RK_FORMAT_RGB_888;
+    case HAL_PIXEL_FORMAT_RGBA_8888:
+        return RK_FORMAT_RGBA_8888;
+    case HAL_PIXEL_FORMAT_RGBX_8888:
+        return RK_FORMAT_RGBX_8888;
+    case HAL_PIXEL_FORMAT_BGRA_8888:
+        return RK_FORMAT_BGRA_8888;
+    case HAL_PIXEL_FORMAT_YCrCb_NV12:
+        return RK_FORMAT_YCbCr_420_SP;
+	case HAL_PIXEL_FORMAT_YCrCb_NV12_VIDEO:
+	   return RK_FORMAT_YCbCr_420_SP;
+    default:
+        return -1;
+    }
+}
+
+#ifndef USE_RGA_COPYBLT
+
 static status_t copyBlt(
         const sp<GraphicBuffer>& dst,
         const sp<GraphicBuffer>& src,
@@ -831,7 +875,7 @@ static status_t copyBlt(
             Rga_Request.src.v_addr   =  Rga_Request.src.uv_addr;
             Rga_Request.src.vir_w = src->stride;
             Rga_Request.src.vir_h = vir_h;
-            Rga_Request.src.format = 0x0;               // RK_FORMAT_RGBA_8888
+            Rga_Request.src.format = hwChangeRgaFormat(src->format);               // RK_FORMAT_RGBA_8888
             Rga_Request.src.act_w = r.width();
             Rga_Request.src.act_h = r.height();
             Rga_Request.src.x_offset = r.left;
@@ -854,7 +898,7 @@ static status_t copyBlt(
             
             Rga_Request.sina = 0;
             Rga_Request.cosa = 0x10000;
-            Rga_Request.dst.format = 0x0;               // RK_FORMAT_RGBA_8888
+            Rga_Request.dst.format = Rga_Request.src.format;               // RK_FORMAT_RGBA_8888
 
             Rga_Request.alpha_rop_flag |= (1 << 5);
 
@@ -908,6 +952,199 @@ ERROR:
 
     return err;
 }
+#else
+/*
+ * RgaCopybltThread add by yzq, because RGA_BLIT_ASYNC would use 3ms,
+ * use thread let the work noblock main thread.
+ */
+class RgaCopybltThread : public Thread {
+	static const int MAX_REQ = 5;
+	struct rga_req  mRga_Request[MAX_REQ];
+	int req_pend;
+	public:
+	RgaCopybltThread():Thread(false) {
+		req_pend = 0;
+		if(fd_rga<0){
+			property_set("sys.gui.version", "1.05");
+			fd_rga = open("/dev/rga",O_RDWR,0);
+			if(fd_rga < 0){
+				ALOGE(" rga open err");
+			}
+		}
+	}
+
+	virtual ~RgaCopybltThread() {
+	}
+
+	bool threadLoop() {
+		while(req_pend){
+			int tmp_pend = req_pend;
+			int i=0;
+			for(i=0;i<MAX_REQ;i++){
+				if(( tmp_pend>>i ) & 0x1){
+					if(ioctl(fd_rga, RGA_BLIT_ASYNC, &mRga_Request[i]) != 0){
+						ALOGE("              rga ioctl  RGA_BLIT_ASYNC  err !!!!!!    fd_rga = %d", fd_rga);
+					}
+					req_pend &= ~(1<<i);
+				}	
+			}
+		}
+		return false;
+	}
+	bool setRgaReq(struct rga_req *req){
+		int i=0;
+		if(fd_rga < 0){
+			ALOGE("can't not setRgaReq,fd_rga = %d",fd_rga);
+			return false;
+		}
+
+		for(i=0;i<MAX_REQ;i++){
+			if(!((req_pend>>i) & 0x1)){
+				req_pend |= (1<<i);
+				memcpy(&mRga_Request[i],req,sizeof(struct rga_req));
+				break;
+			}
+		}
+
+		if(i==MAX_REQ){
+			if(ioctl(fd_rga, RGA_BLIT_ASYNC, req) != 0){
+				ALOGE("              rga ioctl  RGA_BLIT_ASYNC  err !!!!!!    fd_rga = %d", fd_rga);
+			}
+		}
+
+		run();
+		return true;
+	}
+};
+static status_t copyBlt(
+        const sp<GraphicBuffer>& dst,
+        const sp<GraphicBuffer>& src,
+        const Region& reg)
+{
+    // src and dst with, height and format must be identical. no verification
+    // is done here.
+    status_t err;
+    bool ioctl_fail = false;
+    uint8_t const * src_bits = NULL;
+    err = src->lock(GRALLOC_USAGE_SW_READ_OFTEN, reg.bounds(), (void**)&src_bits);
+    ALOGE_IF(err, "error locking src buffer %s", strerror(-err));
+
+    uint8_t* dst_bits = NULL;
+    err = dst->lock(GRALLOC_USAGE_SW_WRITE_OFTEN, reg.bounds(), (void**)&dst_bits);
+    ALOGE_IF(err, "error locking dst buffer %s", strerror(-err));
+
+    int32_t vir_w = 0, vir_h = 0;
+    Region::const_iterator head_(reg.begin());
+    Region::const_iterator tail_(reg.end());
+    if (head_ != tail_ && src_bits && dst_bits) {
+        while (head_ != tail_) {
+            const Rect& r(*head_++);
+            ssize_t h_ = r.height();
+            if (h_ <= 0) continue;
+            int32_t tmp_w = r.right;
+            int32_t tmp_h = r.bottom;
+            vir_w = (vir_w >= tmp_w) ? vir_w : tmp_w;
+            vir_h = (vir_h >= tmp_h) ? vir_h : tmp_h;
+        }
+    }
+	static sp<RgaCopybltThread> rgaCopyblt_t(new RgaCopybltThread());
+    head_ = reg.begin();
+    if (head_ != tail_ && src_bits && dst_bits) {
+        //const size_t bpp = bytesPerPixel(src->format);
+        bool needsync = false;
+        struct rga_req  Rga_Request;
+        while (head_ != tail_) {
+            if(needsync){
+				if(!rgaCopyblt_t->setRgaReq(&Rga_Request))
+					goto ERROR;
+			}
+            const Rect& r(*head_++);
+            ssize_t h = r.height();
+            if (h <= 0) continue;
+
+            memset(&Rga_Request,0x0,sizeof(Rga_Request));
+            //set src info
+            Rga_Request.src.yrgb_addr =  0; //(int)s;
+            Rga_Request.src.uv_addr  = (int)src_bits;
+            Rga_Request.src.v_addr   =  Rga_Request.src.uv_addr;
+            Rga_Request.src.vir_w = src->stride;
+            Rga_Request.src.vir_h = vir_h;
+            Rga_Request.src.format = hwChangeRgaFormat(src->format);               // RK_FORMAT_RGBA_8888
+            Rga_Request.src.act_w = r.width();
+            Rga_Request.src.act_h = r.height();
+            Rga_Request.src.x_offset = r.left;
+            Rga_Request.src.y_offset = r.top;
+
+            //set dst info
+            Rga_Request.dst.yrgb_addr = 0;  //(int)d;
+            Rga_Request.dst.uv_addr  = (int)dst_bits;
+            Rga_Request.dst.v_addr   = Rga_Request.dst.uv_addr;
+            Rga_Request.dst.vir_w = dst->stride;
+            Rga_Request.dst.vir_h = vir_h;
+            Rga_Request.dst.act_w = r.width();
+            Rga_Request.dst.act_h = r.height();
+            Rga_Request.clip.xmin = 0;
+            Rga_Request.clip.xmax = Rga_Request.dst.vir_w - 1;
+            Rga_Request.clip.ymin = 0;
+            Rga_Request.clip.ymax = Rga_Request.dst.vir_h - 1;
+            Rga_Request.dst.x_offset = r.left;
+            Rga_Request.dst.y_offset = r.top;
+            
+            Rga_Request.sina = 0;
+            Rga_Request.cosa = 0x10000;
+            Rga_Request.dst.format =  Rga_Request.src.format;               // RK_FORMAT_RGBA_8888
+
+            Rga_Request.alpha_rop_flag |= (1 << 5);
+
+            Rga_Request.mmu_info.mmu_en    = 1;
+            Rga_Request.mmu_info.mmu_flag  = ((2 & 0x3) << 4) | 1;            
+            Rga_Request.mmu_info.mmu_flag |= ((1<<31) | (1 << 8) | (1<<10));
+
+            needsync = true;
+		}
+		if(needsync){
+			if(!rgaCopyblt_t->setRgaReq(&Rga_Request))
+				goto ERROR;
+		}
+    }
+ERROR:
+    if(ioctl_fail){
+    Region::const_iterator head(reg.begin());
+    Region::const_iterator tail(reg.end());
+    if (head != tail && src_bits && dst_bits) {
+        const size_t bpp = bytesPerPixel(src->format);
+        const size_t dbpr = dst->stride * bpp;
+        const size_t sbpr = src->stride * bpp;
+
+        while (head != tail) {
+            const Rect& r(*head++);
+            ssize_t h = r.height();
+            if (h <= 0) continue;
+            size_t size = r.width() * bpp;
+            uint8_t const * s = src_bits + (r.left + src->stride * r.top) * bpp;
+            uint8_t       * d = dst_bits + (r.left + dst->stride * r.top) * bpp;
+            if (dbpr==sbpr && size==sbpr) {
+                size *= h;
+                h = 1;
+            }
+            do {
+                memcpy(d, s, size);
+                d += dbpr;
+                s += sbpr;
+            } while (--h > 0);
+        }
+    }
+    }
+ 
+    if (src_bits)
+        src->unlock();
+
+    if (dst_bits)
+        dst->unlock();
+
+    return err;
+}
+#endif		//endifdef USE_RGA_COPYBLT  just use in rk32xx   
 
 // ----------------------------------------------------------------------------
 status_t Surface::changehw(int rotation)
@@ -1081,7 +1318,7 @@ status_t Surface::unlockAndPost()
 
     mPostedBuffer = mLockedBuffer;
     mLockedBuffer = 0;
-#ifdef USE_LCDC_COMPOSER
+#if (defined USE_LCDC_COMPOSER) || (defined USE_RGA_COPYBLT)
     if(fd_rga != -1){
         if(ioctl(fd_rga, RGA_FLUSH, NULL) != 0) {
             ALOGE("unlockAndPost RGA_FLUSH err,   fd_rga: %d,  err: %d ", fd_rga, err);

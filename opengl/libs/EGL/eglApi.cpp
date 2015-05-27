@@ -206,6 +206,9 @@ static inline void clearError() { egl_tls_t::clearError(); }
 static inline EGLContext getContext() { return egl_tls_t::getContext(); }
 
 // ----------------------------------------------------------------------------
+#ifdef USE_IN_RK3288
+static int gUnNeedSwap = 0;
+#endif
 
 EGLDisplay eglGetDisplay(EGLNativeDisplayType display)
 {
@@ -1050,6 +1053,13 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface draw)
     ATRACE_CALL();
     clearError();
 
+#ifdef USE_IN_RK3288
+    if(gUnNeedSwap) {
+        gUnNeedSwap = 0;
+        return EGL_TRUE;
+    }
+#endif
+
     const egl_display_ptr dp = validate_display(dpy);
     if (!dp) return EGL_FALSE;
 
@@ -1545,12 +1555,16 @@ EGLClientBuffer eglGetRenderBufferANDROID(EGLDisplay dpy, EGLSurface draw)
 EGLBoolean eglRenderBufferModifiedANDROID(EGLDisplay dpy, EGLSurface draw){
 
     clearError();
+#ifdef USE_IN_RK3288
+    gUnNeedSwap = 1;
+#else
     egl_display_ptr  const dp = get_display(dpy);
     egl_surface_t const * const s = get_surface(draw);
     if (s->cnx->egl.eglGetRenderBufferANDROID) {
             return s->cnx->egl.eglRenderBufferModifiedANDROID(
                         dp->disp.dpy, s->surface);
     }
+#endif
     return EGL_TRUE;
 }
 

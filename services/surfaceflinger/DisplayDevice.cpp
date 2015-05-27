@@ -110,8 +110,14 @@ DisplayDevice::DisplayDevice(
     mViewport.makeInvalid();
     mFrame.makeInvalid();
 
-    mViewport.set(bounds());
-    mFrame.set(bounds());
+    if (mFlinger->orientationSwap()) {
+        mViewport.set(Rect(mDisplayHeight, mDisplayWidth));
+        mFrame.set(Rect(mDisplayHeight, mDisplayWidth));
+    } else {
+        mViewport.set(bounds());
+        mFrame.set(bounds());
+    }
+
 
     // virtual displays are always considered enabled
     mScreenAcquired = (mType >= DisplayDevice::DISPLAY_VIRTUAL);
@@ -134,6 +140,11 @@ DisplayDevice::DisplayDevice(
     setProjection(DisplayState::eOrientationDefault, mViewport, mFrame);
 	_eglRenderBufferModifiedANDROID = (PFNEGLRENDERBUFFERMODIFYEDANDROIDPROC)
                                     eglGetProcAddress("eglRenderBufferModifiedANDROID");
+
+    char pro_value[PROPERTY_VALUE_MAX];
+
+    property_get("ro.rk.soc",pro_value,"0");
+    mIsRk3128 = !strcmp(pro_value,"rk3128");
 }
 
 DisplayDevice::~DisplayDevice() {
@@ -242,8 +253,9 @@ void DisplayDevice::swapBuffers(HWComposer& hwc) const {
     //    (a) we have framebuffer target support (not present on legacy
     //        devices, where HWComposer::commit() handles things); or
     //    (b) this is a virtual display
+    //   Tip: hasBlitComposition depend on ONLY_USE_FB_BUFFERS @hardware\rk29\hwcomposer_rga\rk_hwcomposer.h
     if (hwc.initCheck() != NO_ERROR ||
-            (hwc.hasGlesComposition(mHwcDisplayId) &&
+            ((hwc.hasGlesComposition(mHwcDisplayId) || (mIsRk3128 && hwc.hasBlitComposition(mHwcDisplayId))) &&
              (hwc.supportsFramebufferTarget() || mType >= DISPLAY_VIRTUAL))) {
         EGLBoolean success = eglSwapBuffers(mDisplay, mSurface);
         if (!success) {
@@ -404,6 +416,19 @@ void DisplayDevice::setProjection(int orientation,
         const Rect& newViewport, const Rect& newFrame) {
     Rect viewport(newViewport);
     Rect frame(newFrame);
+
+#ifdef FORCE_SCALE_FULLSCREEN
+    ALOGV("name =%s",getDisplayName().string());
+    ALOGV(" viewport [%d %d]",mViewport.getWidth(),mViewport.getHeight());
+    ALOGV(" frame [%d %d]", frame.getWidth(),frame.getHeight());
+    ALOGV(" hw [%d %d]", getWidth(),getHeight());
+    if(strcmp(getDisplayName().string(),"Built-in Screen")
+        && frame.getWidth() > frame.getHeight())
+    {
+        frame = Rect(0,0,getWidth(),getHeight());
+        ALOGV("update frame [%d,%d]",frame.getWidth(),frame.getHeight());
+    }
+#endif
 
     if (mType == DisplayDevice::DISPLAY_PRIMARY) {
         mClientOrientation = orientation;

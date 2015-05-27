@@ -50,9 +50,36 @@ ifeq ($(TARGET_BOARD_PLATFORM), tegra3)
 	LOCAL_CFLAGS += -DDONT_USE_FENCE_SYNC
 endif
 
+ifeq ($(strip $(TARGET_BOARD_PLATFORM_GPU)), mali400)
+    LOCAL_CFLAGS += -DUSE_GRALLOC_PRIVATE_FLAG
+endif
+
 ifeq ($(strip $(BOARD_USE_LCDC_COMPOSER)),true)
 LOCAL_CFLAGS += -DUSE_LCDC_COMPOSER
 endif
+
+ifeq ($(strip $(BOARD_ENABLE_WFD_SKIP_FRAME)),true)
+LOCAL_CFLAGS += -DENABLE_WFD_SKIP_FRAME
+endif
+
+ifeq ($(strip $(BOARD_USE_LAUNCHER2)),true)
+LOCAL_CFLAGS += -DUSE_LAUNCHER2
+endif
+
+ifeq ($(strip $(TARGET_BOARD_PLATFORM)),rk3288)
+        LOCAL_CFLAGS += -DUSE_RGA_COPYBLT
+endif
+
+ifeq ($(strip $(TARGET_BOARD_PLATFORM)),rk3036)
+LOCAL_CFLAGS += -DPLATFORM_RK3036
+endif
+
+ifeq ($(strip $(GRAPHIC_MEMORY_PROVIDER)),dma_buf)
+LOCAL_CFLAGS += -DUSE_DMA_BUF
+endif
+
+# for fence
+LOCAL_CFLAGS += -DUSE_PREPARE_FENCE
 
 include $(BUILD_SHARED_LIBRARY)
 

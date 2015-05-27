@@ -424,12 +424,14 @@ status_t GLConsumer::updateAndReleaseLocked(const BufferQueue::BufferItem& item)
             buf, mSlots[buf].mGraphicBuffer->handle);
 
     // release old buffer
+    #ifndef USE_PREPARE_FENCE
     if(UseLcdcComposer && !strstr(mName.string(), "unnamed"))
     {
         mCurrentTextureOld = mCurrentTexture;
         mCurrentTextureBufOld = mCurrentTextureBuf;
     }
     else
+   #endif
     {
     if (mCurrentTexture != BufferQueue::INVALID_BUFFER_SLOT) {
         status_t status = releaseBufferLocked(
